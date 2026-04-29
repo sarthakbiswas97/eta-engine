@@ -13,5 +13,8 @@ data/sample_1M.parquet
 # Generated feature artifacts
 data/zone_pair_stats/
 
+# Internal planning/discussion docs
+PLAN.md
+
 # Docker cache
 .docker_cache/
