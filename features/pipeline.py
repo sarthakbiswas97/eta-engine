@@ -146,11 +146,8 @@ class FeaturePipeline:
         # Continuous array
         cont = enriched[CONTINUOUS_FEATURES].to_numpy(dtype=np.float32)
 
-        # Replace any remaining NaN with 0
-        nan_count = np.isnan(cont).sum()
-        if nan_count > 0:
-            logger.warning("Filling %d NaN values in continuous features with 0", nan_count)
-            cont = np.nan_to_num(cont, nan=0.0)
+        # Replace any remaining NaN with 0 (rare unseen zone pairs)
+        cont = np.nan_to_num(cont, nan=0.0)
 
         # Targets
         targets = None

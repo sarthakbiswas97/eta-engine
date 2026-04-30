@@ -63,8 +63,15 @@ def load_and_transform(
     pipeline: FeaturePipeline,
     path: Path,
     sample_n: int | None = None,
+    chunk_size: int = 2_000_000,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Load parquet, optionally sample, and transform through pipeline."""
+    """Load parquet, optionally sample, and transform in chunks.
+
+    Processes data in chunks of chunk_size rows to stay within memory
+    limits on constrained environments (e.g., Colab T4 with 12GB RAM).
+    """
+    import gc
+
     import pandas as pd
 
     logger.info("Loading %s...", path.name)
@@ -72,9 +79,38 @@ def load_and_transform(
     if sample_n is not None and len(df) > sample_n:
         logger.info("Sampling %s rows from %s", f"{sample_n:,}", f"{len(df):,}")
         df = df.sample(n=sample_n, random_state=SEED).reset_index(drop=True)
-    logger.info("Transforming %s rows...", f"{len(df):,}")
-    cat, cont, targets = pipeline.transform_dataframe(df)
-    return cat, cont, targets
+
+    total_rows = len(df)
+    logger.info("Transforming %s rows in chunks of %s...", f"{total_rows:,}", f"{chunk_size:,}")
+
+    cat_chunks: list[np.ndarray] = []
+    cont_chunks: list[np.ndarray] = []
+    target_chunks: list[np.ndarray] = []
+
+    for start in range(0, total_rows, chunk_size):
+        end = min(start + chunk_size, total_rows)
+        chunk_df = df.iloc[start:end].copy()
+        cat, cont, targets = pipeline.transform_dataframe(chunk_df)
+        cat_chunks.append(cat)
+        cont_chunks.append(cont)
+        if targets is not None:
+            target_chunks.append(targets)
+        del chunk_df
+        gc.collect()
+        logger.info("  Processed rows %s-%s / %s", f"{start:,}", f"{end:,}", f"{total_rows:,}")
+
+    # Free the original DataFrame
+    del df
+    gc.collect()
+
+    all_cat = np.concatenate(cat_chunks)
+    all_cont = np.concatenate(cont_chunks)
+    all_targets = np.concatenate(target_chunks) if target_chunks else None
+
+    del cat_chunks, cont_chunks, target_chunks
+    gc.collect()
+
+    return all_cat, all_cont, all_targets
 
 
 def train_one_epoch(
