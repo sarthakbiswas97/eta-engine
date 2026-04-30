@@ -11,14 +11,13 @@ Usage:
     python train.py
 
     # Custom hyperparameters
-    python train.py --epochs 20 --batch-size 8192 --lr 1e-3
+    python train.py --epochs 10 --batch-size 8192 --lr 5e-4
 """
 
 from __future__ import annotations
 
 import argparse
 import logging
-import pickle
 import time
 from dataclasses import asdict
 from pathlib import Path
@@ -27,7 +26,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import OneCycleLR
 
 from features.pipeline import FeaturePipeline
 from model.architecture import ETAModel, ModelConfig
@@ -39,6 +38,7 @@ logger = logging.getLogger(__name__)
 DATA_DIR = Path(__file__).parent / "data"
 STATS_PATH = DATA_DIR / "zone_pair_stats" / "zone_pair_stats.pkl"
 MODEL_DIR = Path(__file__).parent
+CHECKPOINT_DIR = MODEL_DIR / "checkpoints"
 SEED = 42
 
 
@@ -82,14 +82,17 @@ def train_one_epoch(
     loader: torch.utils.data.DataLoader,
     criterion: nn.Module,
     optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.LRScheduler,
     device: torch.device,
+    epoch: int,
+    log_every: int = 500,
 ) -> float:
     """Train for one epoch, return mean loss."""
     model.train()
     total_loss = 0.0
     n_batches = 0
 
-    for pickup, dropoff, cont, target in loader:
+    for batch_idx, (pickup, dropoff, cont, target) in enumerate(loader):
         pickup = pickup.to(device, non_blocking=True)
         dropoff = dropoff.to(device, non_blocking=True)
         cont = cont.to(device, non_blocking=True)
@@ -101,9 +104,18 @@ def train_one_epoch(
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
+        scheduler.step()
 
         total_loss += loss.item()
         n_batches += 1
+
+        if batch_idx > 0 and batch_idx % log_every == 0:
+            avg_loss = total_loss / n_batches
+            lr = optimizer.param_groups[0]["lr"]
+            logger.info(
+                "  Epoch %02d step %d/%d  loss=%.1f  lr=%.2e",
+                epoch, batch_idx, len(loader), avg_loss, lr,
+            )
 
     return total_loss / n_batches
 
@@ -157,12 +169,13 @@ def save_checkpoint(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train ETA prediction model")
     parser.add_argument("--sample", type=int, default=None, help="Sample N rows from training data for fast iteration")
-    parser.add_argument("--epochs", type=int, default=15, help="Number of training epochs")
+    parser.add_argument("--epochs", type=int, default=10, help="Number of training epochs")
     parser.add_argument("--batch-size", type=int, default=4096, help="Batch size")
-    parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
-    parser.add_argument("--patience", type=int, default=5, help="Early stopping patience")
+    parser.add_argument("--lr", type=float, default=5e-4, help="Max learning rate")
+    parser.add_argument("--patience", type=int, default=3, help="Early stopping patience")
     parser.add_argument("--num-workers", type=int, default=4, help="DataLoader workers")
     parser.add_argument("--dev-sample", type=int, default=50_000, help="Dev set sample size for evaluation")
+    parser.add_argument("--save-every", type=int, default=2, help="Save checkpoint every N epochs")
     args = parser.parse_args()
 
     set_seed(SEED)
@@ -203,7 +216,7 @@ def main() -> None:
         num_workers=args.num_workers, pin_memory=pin_memory,
     )
 
-    logger.info("Train: %s rows, %d batches", f"{len(train_loader.dataset):,}", len(train_loader))
+    logger.info("Train: %s rows, %d batches/epoch", f"{len(train_loader.dataset):,}", len(train_loader))
     logger.info("Dev: %s rows, %d batches", f"{len(dev_loader.dataset):,}", len(dev_loader))
 
     # Model
@@ -214,20 +227,38 @@ def main() -> None:
     # Training setup
     criterion = nn.L1Loss()
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
-    scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=args.lr * 0.01)
+
+    # OneCycleLR: warmup from lr/25 -> lr, then cosine decay to lr/1000
+    total_steps = len(train_loader) * args.epochs
+    scheduler = OneCycleLR(
+        optimizer,
+        max_lr=args.lr,
+        total_steps=total_steps,
+        pct_start=0.1,  # 10% warmup
+        anneal_strategy="cos",
+        div_factor=25.0,       # initial_lr = max_lr / 25
+        final_div_factor=1000, # final_lr = max_lr / 1000
+    )
+
+    # Checkpoint directory
+    CHECKPOINT_DIR.mkdir(exist_ok=True)
 
     # Training loop
     best_mae = float("inf")
     patience_counter = 0
-    checkpoint_path = MODEL_DIR / "model.pt"
+    best_path = MODEL_DIR / "model.pt"
 
-    logger.info("Starting training for %d epochs...", args.epochs)
+    logger.info("Starting training: %d epochs, %d total steps", args.epochs, total_steps)
+    logger.info("LR schedule: warmup %.2e -> %.2e -> decay to %.2e",
+                args.lr / 25, args.lr, args.lr / 1000)
+
     for epoch in range(1, args.epochs + 1):
         t0 = time.time()
 
-        train_loss = train_one_epoch(model, train_loader, criterion, optimizer, device)
+        train_loss = train_one_epoch(
+            model, train_loader, criterion, optimizer, scheduler, device, epoch,
+        )
         dev_mae = evaluate(model, dev_loader, device)
-        scheduler.step()
 
         elapsed = time.time() - t0
         lr = optimizer.param_groups[0]["lr"]
@@ -237,10 +268,16 @@ def main() -> None:
             epoch, args.epochs, train_loss, dev_mae, lr, elapsed,
         )
 
+        # Save periodic checkpoint
+        if epoch % args.save_every == 0:
+            epoch_path = CHECKPOINT_DIR / f"epoch_{epoch:02d}.pt"
+            save_checkpoint(model, config, norm_params, dev_mae, epoch, epoch_path)
+
+        # Save best checkpoint
         if dev_mae < best_mae:
             best_mae = dev_mae
             patience_counter = 0
-            save_checkpoint(model, config, norm_params, dev_mae, epoch, checkpoint_path)
+            save_checkpoint(model, config, norm_params, dev_mae, epoch, best_path)
         else:
             patience_counter += 1
             if patience_counter >= args.patience:
@@ -248,7 +285,8 @@ def main() -> None:
                 break
 
     logger.info("Best dev MAE: %.1f s", best_mae)
-    logger.info("Checkpoint: %s", checkpoint_path)
+    logger.info("Best checkpoint: %s", best_path)
+    logger.info("Periodic checkpoints: %s", CHECKPOINT_DIR)
 
 
 if __name__ == "__main__":
