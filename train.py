@@ -1,0 +1,255 @@
+"""Training script for ETA prediction model.
+
+Trains the neural net on precomputed features, validates on dev set,
+saves best checkpoint. Auto-detects cuda/mps/cpu.
+
+Usage:
+    # Quick iteration on small sample (local CPU/MPS)
+    python train.py --sample 100000
+
+    # Full training (GPU)
+    python train.py
+
+    # Custom hyperparameters
+    python train.py --epochs 20 --batch-size 8192 --lr 1e-3
+"""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import pickle
+import time
+from dataclasses import asdict
+from pathlib import Path
+
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingLR
+
+from features.pipeline import FeaturePipeline
+from model.architecture import ETAModel, ModelConfig
+from model.dataset import create_dataloader
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
+logger = logging.getLogger(__name__)
+
+DATA_DIR = Path(__file__).parent / "data"
+STATS_PATH = DATA_DIR / "zone_pair_stats" / "zone_pair_stats.pkl"
+MODEL_DIR = Path(__file__).parent
+SEED = 42
+
+
+def detect_device() -> torch.device:
+    """Auto-detect best available device."""
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+def set_seed(seed: int) -> None:
+    """Set random seeds for reproducibility."""
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def load_and_transform(
+    pipeline: FeaturePipeline,
+    path: Path,
+    sample_n: int | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Load parquet, optionally sample, and transform through pipeline."""
+    import pandas as pd
+
+    logger.info("Loading %s...", path.name)
+    df = pd.read_parquet(path)
+    if sample_n is not None and len(df) > sample_n:
+        logger.info("Sampling %s rows from %s", f"{sample_n:,}", f"{len(df):,}")
+        df = df.sample(n=sample_n, random_state=SEED).reset_index(drop=True)
+    logger.info("Transforming %s rows...", f"{len(df):,}")
+    cat, cont, targets = pipeline.transform_dataframe(df)
+    return cat, cont, targets
+
+
+def train_one_epoch(
+    model: nn.Module,
+    loader: torch.utils.data.DataLoader,
+    criterion: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+) -> float:
+    """Train for one epoch, return mean loss."""
+    model.train()
+    total_loss = 0.0
+    n_batches = 0
+
+    for pickup, dropoff, cont, target in loader:
+        pickup = pickup.to(device, non_blocking=True)
+        dropoff = dropoff.to(device, non_blocking=True)
+        cont = cont.to(device, non_blocking=True)
+        target = target.to(device, non_blocking=True)
+
+        optimizer.zero_grad(set_to_none=True)
+        preds = model(pickup, dropoff, cont)
+        loss = criterion(preds, target)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        optimizer.step()
+
+        total_loss += loss.item()
+        n_batches += 1
+
+    return total_loss / n_batches
+
+
+@torch.no_grad()
+def evaluate(
+    model: nn.Module,
+    loader: torch.utils.data.DataLoader,
+    device: torch.device,
+) -> float:
+    """Evaluate on a dataset, return MAE in seconds."""
+    model.eval()
+    all_preds = []
+    all_targets = []
+
+    for pickup, dropoff, cont, target in loader:
+        pickup = pickup.to(device, non_blocking=True)
+        dropoff = dropoff.to(device, non_blocking=True)
+        cont = cont.to(device, non_blocking=True)
+
+        preds = model(pickup, dropoff, cont)
+        all_preds.append(preds.cpu())
+        all_targets.append(target)
+
+    preds_t = torch.cat(all_preds)
+    targets_t = torch.cat(all_targets)
+    mae = torch.mean(torch.abs(preds_t - targets_t)).item()
+    return mae
+
+
+def save_checkpoint(
+    model: nn.Module,
+    config: ModelConfig,
+    norm_params: dict[str, np.ndarray] | None,
+    dev_mae: float,
+    epoch: int,
+    path: Path,
+) -> None:
+    """Save model checkpoint with metadata."""
+    checkpoint = {
+        "model_state_dict": model.state_dict(),
+        "model_config": asdict(config),
+        "norm_params": norm_params,
+        "dev_mae": dev_mae,
+        "epoch": epoch,
+    }
+    torch.save(checkpoint, path)
+    logger.info("Saved checkpoint to %s (dev MAE: %.1f s)", path, dev_mae)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Train ETA prediction model")
+    parser.add_argument("--sample", type=int, default=None, help="Sample N rows from training data for fast iteration")
+    parser.add_argument("--epochs", type=int, default=15, help="Number of training epochs")
+    parser.add_argument("--batch-size", type=int, default=4096, help="Batch size")
+    parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
+    parser.add_argument("--patience", type=int, default=5, help="Early stopping patience")
+    parser.add_argument("--num-workers", type=int, default=4, help="DataLoader workers")
+    parser.add_argument("--dev-sample", type=int, default=50_000, help="Dev set sample size for evaluation")
+    args = parser.parse_args()
+
+    set_seed(SEED)
+    device = detect_device()
+    logger.info("Device: %s", device)
+
+    # Load pipeline
+    if not STATS_PATH.exists():
+        raise SystemExit(f"Missing {STATS_PATH}. Run `python -m features.zone_pair_stats` first.")
+    pipeline = FeaturePipeline.from_artifacts(STATS_PATH)
+
+    # Load and transform data
+    train_cat, train_cont, train_targets = load_and_transform(
+        pipeline, DATA_DIR / "train.parquet", sample_n=args.sample,
+    )
+    dev_cat, dev_cont, dev_targets = load_and_transform(
+        pipeline, DATA_DIR / "dev.parquet", sample_n=args.dev_sample,
+    )
+
+    # Fit normalization on training data
+    pipeline.fit_normalization(train_cont)
+    train_cont = pipeline.normalize(train_cont)
+    dev_cont = pipeline.normalize(dev_cont)
+
+    # Save normalization params for inference
+    norm_params = pipeline.normalization_params
+
+    # Create data loaders
+    pin_memory = device.type == "cuda"
+    train_loader = create_dataloader(
+        train_cat, train_cont, train_targets,
+        batch_size=args.batch_size, shuffle=True,
+        num_workers=args.num_workers, pin_memory=pin_memory,
+    )
+    dev_loader = create_dataloader(
+        dev_cat, dev_cont, dev_targets,
+        batch_size=args.batch_size * 2, shuffle=False,
+        num_workers=args.num_workers, pin_memory=pin_memory,
+    )
+
+    logger.info("Train: %s rows, %d batches", f"{len(train_loader.dataset):,}", len(train_loader))
+    logger.info("Dev: %s rows, %d batches", f"{len(dev_loader.dataset):,}", len(dev_loader))
+
+    # Model
+    config = ModelConfig(n_continuous=train_cont.shape[1])
+    model = ETAModel(config).to(device)
+    logger.info("Model parameters: %s", f"{model.count_parameters():,}")
+
+    # Training setup
+    criterion = nn.L1Loss()
+    optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=args.lr * 0.01)
+
+    # Training loop
+    best_mae = float("inf")
+    patience_counter = 0
+    checkpoint_path = MODEL_DIR / "model.pt"
+
+    logger.info("Starting training for %d epochs...", args.epochs)
+    for epoch in range(1, args.epochs + 1):
+        t0 = time.time()
+
+        train_loss = train_one_epoch(model, train_loader, criterion, optimizer, device)
+        dev_mae = evaluate(model, dev_loader, device)
+        scheduler.step()
+
+        elapsed = time.time() - t0
+        lr = optimizer.param_groups[0]["lr"]
+
+        logger.info(
+            "Epoch %02d/%02d  train_loss=%.1f  dev_mae=%.1f s  lr=%.2e  time=%.0fs",
+            epoch, args.epochs, train_loss, dev_mae, lr, elapsed,
+        )
+
+        if dev_mae < best_mae:
+            best_mae = dev_mae
+            patience_counter = 0
+            save_checkpoint(model, config, norm_params, dev_mae, epoch, checkpoint_path)
+        else:
+            patience_counter += 1
+            if patience_counter >= args.patience:
+                logger.info("Early stopping at epoch %d (patience=%d)", epoch, args.patience)
+                break
+
+    logger.info("Best dev MAE: %.1f s", best_mae)
+    logger.info("Checkpoint: %s", checkpoint_path)
+
+
+if __name__ == "__main__":
+    main()
