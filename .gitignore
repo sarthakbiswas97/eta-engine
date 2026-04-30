@@ -25,6 +25,7 @@ checkpoints/
 PLAN.md
 notes.md
 research.md
+.progress/
 
 # Docker cache
 .docker_cache/

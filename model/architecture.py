@@ -23,7 +23,7 @@ class ModelConfig:
     zone_embed_dim: int = 50       # embedding dim per zone (pickup and dropoff separate)
     pair_hash_buckets: int = 16384 # hash buckets for zone-pair embedding
     pair_embed_dim: int = 16       # embedding dim for hashed zone pair
-    n_continuous: int = 19         # number of continuous input features
+    n_continuous: int = 24         # number of continuous input features
     zone_mlp_dim: int = 64         # output dim of zone interaction MLP
     cont_mlp_dim: int = 64         # output dim of continuous branch
     hidden_dims: tuple[int, ...] = (256, 128, 64)  # combined MLP hidden layers

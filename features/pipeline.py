@@ -16,7 +16,7 @@ Usage:
 from __future__ import annotations
 
 import logging
-from dataclasses import asdict, dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -43,8 +43,13 @@ ZONE_PAIR_CONTINUOUS = [
     "pair_count",
     "pair_p25",
     "pair_p75",
+    "pair_iqr",
+    "log_pair_count",
+    "same_zone",
     "pu_mean",
     "do_mean",
+    "pair_tb_mean",
+    "pair_tb_median",
 ]
 
 CONTINUOUS_FEATURES = ZONE_PAIR_CONTINUOUS + TEMPORAL_COLUMNS
@@ -52,24 +57,6 @@ CONTINUOUS_FEATURES = ZONE_PAIR_CONTINUOUS + TEMPORAL_COLUMNS
 CATEGORICAL_FEATURES = ["pickup_zone", "dropoff_zone"]
 
 NUM_ZONES = 266  # zone IDs 1-265, index 0 reserved for padding/unknown
-
-
-@dataclass(frozen=True)
-class FeatureSchema:
-    """Describes the feature layout for the model."""
-
-    categorical: list[str]
-    continuous: list[str]
-    num_zones: int
-    n_continuous: int
-
-
-SCHEMA = FeatureSchema(
-    categorical=CATEGORICAL_FEATURES,
-    continuous=CONTINUOUS_FEATURES,
-    num_zones=NUM_ZONES,
-    n_continuous=len(CONTINUOUS_FEATURES),
-)
 
 
 class FeaturePipeline:
@@ -86,6 +73,10 @@ class FeaturePipeline:
         stats = load_stats(stats_path)
         return cls(zone_pair_stats=stats)
 
+    @property
+    def n_continuous(self) -> int:
+        return len(CONTINUOUS_FEATURES)
+
     def transform_single(self, request: dict) -> tuple[np.ndarray, np.ndarray]:
         """Transform a single request dict into (categorical, continuous) arrays.
 
@@ -95,12 +86,13 @@ class FeaturePipeline:
         """
         pickup_zone = int(request["pickup_zone"])
         dropoff_zone = int(request["dropoff_zone"])
+        ts = datetime.fromisoformat(request["requested_at"])
 
         # Categorical
         cat = np.array([pickup_zone, dropoff_zone], dtype=np.int32)
 
-        # Zone-pair stats
-        zp = zone_pair_lookup(self._stats, pickup_zone, dropoff_zone)
+        # Zone-pair stats (with temporal bucket)
+        zp = zone_pair_lookup(self._stats, pickup_zone, dropoff_zone, hour=ts.hour)
         zp_values = [
             zp.pair_mean_smoothed,
             zp.pair_median,
@@ -108,8 +100,13 @@ class FeaturePipeline:
             float(zp.pair_count),
             zp.pair_p25,
             zp.pair_p75,
+            zp.pair_iqr,
+            zp.log_pair_count,
+            float(zp.same_zone),
             zp.pu_mean,
             zp.do_mean,
+            zp.pair_tb_mean,
+            zp.pair_tb_median,
         ]
 
         # Temporal
@@ -125,7 +122,9 @@ class FeaturePipeline:
         return cat, cont
 
     def transform_dataframe(
-        self, df: pd.DataFrame, target_col: str | None = "duration_seconds",
+        self,
+        df: pd.DataFrame,
+        target_col: str | None = "duration_seconds",
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
         """Transform a DataFrame into (categorical, continuous, targets) arrays.
 
@@ -157,10 +156,7 @@ class FeaturePipeline:
         return cat, cont, targets
 
     def fit_normalization(self, cont: np.ndarray) -> None:
-        """Compute mean/std from training continuous features for normalization.
-
-        Call this once on training data, then transform_single will apply it.
-        """
+        """Compute mean/std from training continuous features for normalization."""
         self._cont_means = cont.mean(axis=0).astype(np.float32)
         self._cont_stds = cont.std(axis=0).astype(np.float32)
         # Prevent division by zero for constant features
@@ -184,7 +180,3 @@ class FeaturePipeline:
         """Restore normalization params from serialized form."""
         self._cont_means = params["means"]
         self._cont_stds = params["stds"]
-
-    @property
-    def schema(self) -> FeatureSchema:
-        return SCHEMA

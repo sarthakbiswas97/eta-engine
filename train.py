@@ -212,6 +212,7 @@ def main() -> None:
     parser.add_argument("--num-workers", type=int, default=4, help="DataLoader workers")
     parser.add_argument("--dev-sample", type=int, default=50_000, help="Dev set sample size for evaluation")
     parser.add_argument("--save-every", type=int, default=2, help="Save checkpoint every N epochs")
+    parser.add_argument("--loss", type=str, default="huber", choices=["l1", "huber"], help="Loss function")
     args = parser.parse_args()
 
     set_seed(SEED)
@@ -261,7 +262,12 @@ def main() -> None:
     logger.info("Model parameters: %s", f"{model.count_parameters():,}")
 
     # Training setup
-    criterion = nn.L1Loss()
+    if args.loss == "huber":
+        criterion = nn.HuberLoss(delta=300.0)
+        logger.info("Loss: HuberLoss(delta=300)")
+    else:
+        criterion = nn.L1Loss()
+        logger.info("Loss: L1Loss (MAE)")
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
 
     # OneCycleLR: warmup from lr/25 -> lr, then cosine decay to lr/1000

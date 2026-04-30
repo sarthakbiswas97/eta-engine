@@ -1,6 +1,5 @@
-# Reference Dockerfile for the ETA Challenge.
-# Target total image size: ≤ 2.5 GB. This baseline builds to ~2.02 GB
-# (xgboost pulls scipy + nvidia-nccl-cu12; trim those if you need headroom).
+# Dockerfile for ETA Challenge submission.
+# Target total image size: <= 2.5 GB.
 #
 # Build:
 #   docker build -t my-eta .
@@ -11,20 +10,20 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# libgomp1 is required for xgboost at runtime on slim images
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        libgomp1 \
-    && rm -rf /var/lib/apt/lists/*
-
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Install CPU-only PyTorch to keep image small (~200MB vs ~2GB for full torch)
+RUN pip install --no-cache-dir \
+        torch --index-url https://download.pytorch.org/whl/cpu \
+    && pip install --no-cache-dir -r requirements.txt
 
-# Submission surface: predict.py + grade.py + trained weights. We do NOT
-# unpickle model.pkl at build time — that runs untrusted candidate code on
-# the grader host before any sandbox applies. The first docker-run invocation
-# is the smoke test; it runs inside the sandboxed grader container.
+# Copy source modules
+COPY features/ ./features/
+COPY model/ ./model/
+
+# Copy submission surface + trained weights + artifacts
 COPY predict.py grade.py ./
-COPY model.pkl ./
+COPY model.pt ./
+COPY data/zone_pair_stats/zone_pair_stats.pkl ./data/zone_pair_stats/zone_pair_stats.pkl
 
 # Grader invokes:  python grade.py <input.parquet> <output.csv>
 ENTRYPOINT ["python", "grade.py"]
