@@ -222,35 +222,45 @@ def lookup(stats: dict[str, Any], pickup_zone: int, dropoff_zone: int) -> ZonePa
     )
 
 
+def _pair_key(pickup: int, dropoff: int) -> int:
+    """Encode (pickup, dropoff) as a single integer. Max = 265*1000+265 = 265265."""
+    return pickup * 1000 + dropoff
+
+
 def enrich_dataframe(df: pd.DataFrame, stats: dict[str, Any]) -> pd.DataFrame:
-    """Add zone-pair stat columns to a DataFrame (vectorized).
+    """Add zone-pair stat columns to a DataFrame (vectorized, memory-efficient).
 
     Adds columns: pair_mean_smoothed, pair_median, pair_std, pair_count,
     pair_p25, pair_p75, pu_mean, do_mean.
+
+    Uses integer keys (pickup*1000 + dropoff) instead of tuple keys to
+    avoid creating millions of Python tuple objects.
     """
     pair_dict = stats["pair"]
     pu_dict = stats["pickup"]
     do_dict = stats["dropoff"]
     global_stats = stats["global"]
 
-    # Build pair keys
-    pair_keys = list(zip(df["pickup_zone"], df["dropoff_zone"]))
+    # Integer-keyed pair lookup (no tuple allocation for 37M rows)
+    pair_int_keys = df["pickup_zone"].values * 1000 + df["dropoff_zone"].values
 
-    # Vectorized lookup via Series.map
-    pair_series = pd.Series(pair_keys)
-
+    # Build integer-keyed mappings once
     feature_names = ["pair_mean_smoothed", "pair_median", "pair_std", "pair_count", "pair_p25", "pair_p75"]
+    int_mappings: dict[str, dict[int, float]] = {}
     for feat in feature_names:
-        mapping = {k: v[feat] for k, v in pair_dict.items()}
-        col = pair_series.map(mapping)
+        int_mappings[feat] = {_pair_key(k[0], k[1]): v[feat] for k, v in pair_dict.items()}
+
+    pair_key_series = pd.Series(pair_int_keys)
+
+    for feat in feature_names:
+        col = pair_key_series.map(int_mappings[feat])
 
         if feat == "pair_count":
             col = col.fillna(0).astype(np.int32)
         elif feat == "pair_std":
             col = col.fillna(global_stats["global_std"])
         elif feat == "pair_median":
-            # For unseen pairs, fall back to avg of pu_mean + do_mean
-            col = col.fillna(np.nan)
+            col = col.fillna(np.nan)  # filled below with zone-level fallback
         elif feat == "pair_p25":
             col = col.fillna(global_stats["global_p25"])
         elif feat == "pair_p75":
