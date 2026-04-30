@@ -1,0 +1,5 @@
+# Training dependencies (not needed for inference)
+-r requirements.txt
+mlflow>=2.0
+python-dotenv>=1.0
+huggingface_hub>=0.20

@@ -1,17 +1,18 @@
 """Training script for ETA prediction model.
 
 Trains the neural net on precomputed features, validates on dev set,
-saves best checkpoint. Auto-detects cuda/mps/cpu.
+saves best checkpoint. Auto-detects cuda/mps/cpu. Logs all experiments
+to MLflow for tracking.
 
 Usage:
     # Quick iteration on small sample (local CPU/MPS)
-    python train.py --sample 100000
+    python train.py --sample 100000 --run-name test-local
 
     # Full training (GPU)
-    python train.py
+    python train.py --run-name v2-huber-24feat
 
     # Custom hyperparameters
-    python train.py --epochs 10 --batch-size 8192 --lr 5e-4
+    python train.py --epochs 10 --batch-size 8192 --lr 5e-4 --loss huber
 """
 
 from __future__ import annotations
@@ -22,6 +23,7 @@ import time
 from dataclasses import asdict
 from pathlib import Path
 
+import mlflow
 import numpy as np
 import torch
 import torch.nn as nn
@@ -35,10 +37,12 @@ from model.dataset import create_dataloader
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
-DATA_DIR = Path(__file__).parent / "data"
+PROJECT_ROOT = Path(__file__).parent
+DATA_DIR = PROJECT_ROOT / "data"
 STATS_PATH = DATA_DIR / "zone_pair_stats" / "zone_pair_stats.pkl"
-MODEL_DIR = Path(__file__).parent
-CHECKPOINT_DIR = MODEL_DIR / "checkpoints"
+MODEL_DIR = PROJECT_ROOT
+CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints"
+MLRUNS_DIR = PROJECT_ROOT / "mlruns"
 SEED = 42
 
 
@@ -99,7 +103,6 @@ def load_and_transform(
         gc.collect()
         logger.info("  Processed rows %s-%s / %s", f"{start:,}", f"{end:,}", f"{total_rows:,}")
 
-    # Free the original DataFrame
     del df
     gc.collect()
 
@@ -213,11 +216,22 @@ def main() -> None:
     parser.add_argument("--dev-sample", type=int, default=50_000, help="Dev set sample size for evaluation")
     parser.add_argument("--save-every", type=int, default=2, help="Save checkpoint every N epochs")
     parser.add_argument("--loss", type=str, default="huber", choices=["l1", "huber"], help="Loss function")
+    parser.add_argument("--run-name", type=str, default=None, help="MLflow run name (e.g., v2-huber-24feat)")
     args = parser.parse_args()
 
     set_seed(SEED)
     device = detect_device()
     logger.info("Device: %s", device)
+
+    # MLflow setup
+    mlflow.set_tracking_uri(f"file://{MLRUNS_DIR}")
+    mlflow.set_experiment("eta-engine")
+
+    # Auto-generate run name if not provided
+    run_name = args.run_name
+    if run_name is None:
+        sample_tag = f"-{args.sample // 1000}k" if args.sample else "-full"
+        run_name = f"{args.loss}-{args.epochs}ep-lr{args.lr}{sample_tag}"
 
     # Load pipeline
     if not STATS_PATH.exists():
@@ -236,8 +250,6 @@ def main() -> None:
     pipeline.fit_normalization(train_cont)
     train_cont = pipeline.normalize(train_cont)
     dev_cont = pipeline.normalize(dev_cont)
-
-    # Save normalization params for inference
     norm_params = pipeline.normalization_params
 
     # Create data loaders
@@ -268,67 +280,113 @@ def main() -> None:
     else:
         criterion = nn.L1Loss()
         logger.info("Loss: L1Loss (MAE)")
+
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
 
-    # OneCycleLR: warmup from lr/25 -> lr, then cosine decay to lr/1000
     total_steps = len(train_loader) * args.epochs
     scheduler = OneCycleLR(
         optimizer,
         max_lr=args.lr,
         total_steps=total_steps,
-        pct_start=0.1,  # 10% warmup
+        pct_start=0.1,
         anneal_strategy="cos",
-        div_factor=25.0,       # initial_lr = max_lr / 25
-        final_div_factor=1000, # final_lr = max_lr / 1000
+        div_factor=25.0,
+        final_div_factor=1000,
     )
 
     # Checkpoint directory
     CHECKPOINT_DIR.mkdir(exist_ok=True)
 
-    # Training loop
-    best_mae = float("inf")
-    patience_counter = 0
-    best_path = MODEL_DIR / "model.pt"
+    # Start MLflow run
+    with mlflow.start_run(run_name=run_name):
+        # Log parameters
+        mlflow.log_params({
+            "epochs": args.epochs,
+            "batch_size": args.batch_size,
+            "lr": args.lr,
+            "loss": args.loss,
+            "patience": args.patience,
+            "sample": args.sample or "full",
+            "dev_sample": args.dev_sample,
+            "train_rows": len(train_loader.dataset),
+            "dev_rows": len(dev_loader.dataset),
+            "n_continuous": train_cont.shape[1],
+            "total_params": model.count_parameters(),
+            "device": str(device),
+            "seed": SEED,
+        })
+        # Log model config
+        mlflow.log_params({f"model_{k}": v for k, v in asdict(config).items()})
+        # Log GPU info
+        if device.type == "cuda":
+            mlflow.log_param("gpu", torch.cuda.get_device_name(0))
 
-    logger.info("Starting training: %d epochs, %d total steps", args.epochs, total_steps)
-    logger.info("LR schedule: warmup %.2e -> %.2e -> decay to %.2e",
-                args.lr / 25, args.lr, args.lr / 1000)
+        # Training loop
+        best_mae = float("inf")
+        patience_counter = 0
+        best_path = MODEL_DIR / "model.pt"
+        training_start = time.time()
 
-    for epoch in range(1, args.epochs + 1):
-        t0 = time.time()
+        logger.info("Starting training: %d epochs, %d total steps", args.epochs, total_steps)
+        logger.info("LR schedule: warmup %.2e -> %.2e -> decay to %.2e",
+                    args.lr / 25, args.lr, args.lr / 1000)
 
-        train_loss = train_one_epoch(
-            model, train_loader, criterion, optimizer, scheduler, device, epoch,
-        )
-        dev_mae = evaluate(model, dev_loader, device)
+        for epoch in range(1, args.epochs + 1):
+            t0 = time.time()
 
-        elapsed = time.time() - t0
-        lr = optimizer.param_groups[0]["lr"]
+            train_loss = train_one_epoch(
+                model, train_loader, criterion, optimizer, scheduler, device, epoch,
+            )
+            dev_mae = evaluate(model, dev_loader, device)
 
-        logger.info(
-            "Epoch %02d/%02d  train_loss=%.1f  dev_mae=%.1f s  lr=%.2e  time=%.0fs",
-            epoch, args.epochs, train_loss, dev_mae, lr, elapsed,
-        )
+            elapsed = time.time() - t0
+            lr = optimizer.param_groups[0]["lr"]
 
-        # Save periodic checkpoint
-        if epoch % args.save_every == 0:
-            epoch_path = CHECKPOINT_DIR / f"epoch_{epoch:02d}.pt"
-            save_checkpoint(model, config, norm_params, dev_mae, epoch, epoch_path)
+            logger.info(
+                "Epoch %02d/%02d  train_loss=%.1f  dev_mae=%.1f s  lr=%.2e  time=%.0fs",
+                epoch, args.epochs, train_loss, dev_mae, lr, elapsed,
+            )
 
-        # Save best checkpoint
-        if dev_mae < best_mae:
-            best_mae = dev_mae
-            patience_counter = 0
-            save_checkpoint(model, config, norm_params, dev_mae, epoch, best_path)
-        else:
-            patience_counter += 1
-            if patience_counter >= args.patience:
-                logger.info("Early stopping at epoch %d (patience=%d)", epoch, args.patience)
-                break
+            # Log metrics to MLflow
+            mlflow.log_metrics({
+                "train_loss": train_loss,
+                "dev_mae": dev_mae,
+                "lr": lr,
+                "epoch_time": elapsed,
+            }, step=epoch)
 
-    logger.info("Best dev MAE: %.1f s", best_mae)
-    logger.info("Best checkpoint: %s", best_path)
-    logger.info("Periodic checkpoints: %s", CHECKPOINT_DIR)
+            # Save periodic checkpoint
+            if epoch % args.save_every == 0:
+                epoch_path = CHECKPOINT_DIR / f"epoch_{epoch:02d}.pt"
+                save_checkpoint(model, config, norm_params, dev_mae, epoch, epoch_path)
+
+            # Save best checkpoint
+            if dev_mae < best_mae:
+                best_mae = dev_mae
+                patience_counter = 0
+                save_checkpoint(model, config, norm_params, dev_mae, epoch, best_path)
+            else:
+                patience_counter += 1
+                if patience_counter >= args.patience:
+                    logger.info("Early stopping at epoch %d (patience=%d)", epoch, args.patience)
+                    break
+
+        total_time = time.time() - training_start
+
+        # Log final metrics
+        mlflow.log_metrics({
+            "best_dev_mae": best_mae,
+            "best_epoch": epoch - patience_counter,
+            "total_training_minutes": total_time / 60,
+            "epochs_completed": epoch,
+        })
+
+        # Log best model as artifact
+        mlflow.log_artifact(str(best_path))
+
+        logger.info("Best dev MAE: %.1f s", best_mae)
+        logger.info("Best checkpoint: %s", best_path)
+        logger.info("MLflow run: %s", mlflow.active_run().info.run_id)
 
 
 if __name__ == "__main__":

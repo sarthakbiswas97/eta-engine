@@ -21,6 +21,9 @@ model.pt
 model.pkl
 checkpoints/
 
+# MLflow experiment tracking
+mlruns/
+
 # Internal planning/discussion docs
 PLAN.md
 notes.md
