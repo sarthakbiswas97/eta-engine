@@ -27,6 +27,9 @@ _model = ETAModel(_config)
 _model.load_state_dict(_checkpoint["model_state_dict"])
 _model.eval()
 
+# Check if model was trained with log-target
+_log_target = _checkpoint.get("log_target", False)
+
 # Load feature pipeline with normalization
 _pipeline = FeaturePipeline.from_artifacts(_STATS_PATH)
 _pipeline.set_normalization_params(_checkpoint["norm_params"])
@@ -52,4 +55,8 @@ def predict(request: dict) -> float:
     with torch.inference_mode():
         pred = _model(pickup, dropoff, cont_t)
 
-    return float(pred.item())
+    result = float(pred.item())
+    if _log_target:
+        import math
+        result = math.exp(result)
+    return result

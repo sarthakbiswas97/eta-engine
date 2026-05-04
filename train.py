@@ -164,8 +164,14 @@ def evaluate(
     model: nn.Module,
     loader: torch.utils.data.DataLoader,
     device: torch.device,
+    log_target: bool = False,
 ) -> float:
-    """Evaluate on a dataset, return MAE in seconds."""
+    """Evaluate on a dataset, return MAE in seconds.
+
+    If log_target=True, model outputs log-space predictions. Converts
+    back to seconds via exp() before computing MAE. Targets in the loader
+    are always in original seconds for dev evaluation.
+    """
     model.eval()
     all_preds = []
     all_targets = []
@@ -176,6 +182,8 @@ def evaluate(
         cont = cont.to(device, non_blocking=True)
 
         preds = model(pickup, dropoff, cont)
+        if log_target:
+            preds = preds.exp()
         all_preds.append(preds.cpu())
         all_targets.append(target)
 
@@ -192,6 +200,7 @@ def save_checkpoint(
     dev_mae: float,
     epoch: int,
     path: Path,
+    log_target: bool = False,
 ) -> None:
     """Save model checkpoint with metadata."""
     checkpoint = {
@@ -200,6 +209,7 @@ def save_checkpoint(
         "norm_params": norm_params,
         "dev_mae": dev_mae,
         "epoch": epoch,
+        "log_target": log_target,
     }
     torch.save(checkpoint, path)
     logger.info("Saved checkpoint to %s (dev MAE: %.1f s)", path, dev_mae)
@@ -216,6 +226,7 @@ def main() -> None:
     parser.add_argument("--dev-sample", type=int, default=50_000, help="Dev set sample size for evaluation")
     parser.add_argument("--save-every", type=int, default=2, help="Save checkpoint every N epochs")
     parser.add_argument("--loss", type=str, default="huber", choices=["l1", "huber"], help="Loss function")
+    parser.add_argument("--log-target", action="store_true", help="Train on log(duration), exp() at inference")
     parser.add_argument("--run-name", type=str, default=None, help="MLflow run name (e.g., v2-huber-24feat)")
     args = parser.parse_args()
 
@@ -245,6 +256,12 @@ def main() -> None:
     dev_cat, dev_cont, dev_targets = load_and_transform(
         pipeline, DATA_DIR / "dev.parquet", sample_n=args.dev_sample,
     )
+
+    # Apply log-target transform if requested
+    if args.log_target:
+        logger.info("Log-target mode: training on log(duration)")
+        train_targets = np.log(np.clip(train_targets, 1.0, None))
+        # Keep dev_targets in original seconds for MAE computation
 
     # Fit normalization on training data
     pipeline.fit_normalization(train_cont)
@@ -305,6 +322,7 @@ def main() -> None:
             "batch_size": args.batch_size,
             "lr": args.lr,
             "loss": args.loss,
+            "log_target": args.log_target,
             "patience": args.patience,
             "sample": args.sample or "full",
             "dev_sample": args.dev_sample,
@@ -337,7 +355,7 @@ def main() -> None:
             train_loss = train_one_epoch(
                 model, train_loader, criterion, optimizer, scheduler, device, epoch,
             )
-            dev_mae = evaluate(model, dev_loader, device)
+            dev_mae = evaluate(model, dev_loader, device, log_target=args.log_target)
 
             elapsed = time.time() - t0
             lr = optimizer.param_groups[0]["lr"]
@@ -358,13 +376,13 @@ def main() -> None:
             # Save periodic checkpoint
             if epoch % args.save_every == 0:
                 epoch_path = CHECKPOINT_DIR / f"epoch_{epoch:02d}.pt"
-                save_checkpoint(model, config, norm_params, dev_mae, epoch, epoch_path)
+                save_checkpoint(model, config, norm_params, dev_mae, epoch, epoch_path, args.log_target)
 
             # Save best checkpoint
             if dev_mae < best_mae:
                 best_mae = dev_mae
                 patience_counter = 0
-                save_checkpoint(model, config, norm_params, dev_mae, epoch, best_path)
+                save_checkpoint(model, config, norm_params, dev_mae, epoch, best_path, args.log_target)
             else:
                 patience_counter += 1
                 if patience_counter >= args.patience:
