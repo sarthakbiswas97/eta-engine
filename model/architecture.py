@@ -24,11 +24,11 @@ class ModelConfig:
     pair_hash_buckets: int = 16384 # hash buckets for zone-pair embedding
     pair_embed_dim: int = 16       # embedding dim for hashed zone pair
     n_continuous: int = 24         # number of continuous input features
-    zone_mlp_dim: int = 64         # output dim of zone interaction MLP
-    cont_mlp_dim: int = 64         # output dim of continuous branch
-    hidden_dims: tuple[int, ...] = (256, 128, 64)  # combined MLP hidden layers
-    dropout: float = 0.2
-    embed_dropout: float = 0.1
+    zone_mlp_dim: int = 128        # output dim of zone interaction MLP
+    cont_mlp_dim: int = 128        # output dim of continuous branch
+    hidden_dims: tuple[int, ...] = (256, 128)  # combined MLP residual block dims
+    dropout: float = 0.3
+    embed_dropout: float = 0.15
 
 
 class ZonePairHasher(nn.Module):
@@ -53,6 +53,23 @@ class ZonePairHasher(nn.Module):
     def forward(self, pickup: torch.Tensor, dropoff: torch.Tensor) -> torch.Tensor:
         bucket_idx = self._hash_pair(pickup, dropoff)
         return self.dropout(self.embedding(bucket_idx))
+
+
+class ResidualBlock(nn.Module):
+    """Residual block: Linear -> BN -> SiLU -> Dropout -> Linear -> add input."""
+
+    def __init__(self, dim: int, dropout: float = 0.2) -> None:
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Linear(dim, dim),
+            nn.BatchNorm1d(dim),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim, dim),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.block(x)
 
 
 class ETAModel(nn.Module):
@@ -89,6 +106,10 @@ class ETAModel(nn.Module):
         zone_input_dim = c.zone_embed_dim * 4 + c.pair_embed_dim
         self.zone_mlp = nn.Sequential(
             nn.Linear(zone_input_dim, c.zone_mlp_dim),
+            nn.BatchNorm1d(c.zone_mlp_dim),
+            nn.SiLU(),
+            nn.Dropout(c.dropout),
+            nn.Linear(c.zone_mlp_dim, c.zone_mlp_dim),
             nn.SiLU(),
             nn.Dropout(c.dropout),
         )
@@ -97,23 +118,30 @@ class ETAModel(nn.Module):
         self.cont_bn = nn.BatchNorm1d(c.n_continuous)
         self.cont_mlp = nn.Sequential(
             nn.Linear(c.n_continuous, c.cont_mlp_dim),
+            nn.BatchNorm1d(c.cont_mlp_dim),
+            nn.SiLU(),
+            nn.Dropout(c.dropout),
+            nn.Linear(c.cont_mlp_dim, c.cont_mlp_dim),
             nn.SiLU(),
             nn.Dropout(c.dropout),
         )
 
-        # Combined MLP
+        # Combined MLP with residual blocks
         combined_dim = c.zone_mlp_dim + c.cont_mlp_dim
         layers: list[nn.Module] = []
         prev_dim = combined_dim
         for hidden_dim in c.hidden_dims:
-            layers.extend([
-                nn.Linear(prev_dim, hidden_dim),
-                nn.BatchNorm1d(hidden_dim),
-                nn.SiLU(),
-                nn.Dropout(c.dropout),
-            ])
+            # Project to hidden_dim if needed, then apply residual block
+            if prev_dim != hidden_dim:
+                layers.append(nn.Linear(prev_dim, hidden_dim))
+                layers.append(nn.SiLU())
+            layers.append(ResidualBlock(hidden_dim, c.dropout))
             prev_dim = hidden_dim
-        layers.append(nn.Linear(prev_dim, 1))
+
+        # Output head
+        layers.append(nn.Linear(prev_dim, 64))
+        layers.append(nn.SiLU())
+        layers.append(nn.Linear(64, 1))
 
         self.combined_mlp = nn.Sequential(*layers)
 
