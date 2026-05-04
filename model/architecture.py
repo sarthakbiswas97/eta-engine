@@ -84,8 +84,9 @@ class ETAModel(nn.Module):
         # Zone-pair hash embedding
         self.pair_hasher = ZonePairHasher(c.pair_hash_buckets, c.pair_embed_dim, c.embed_dropout)
 
-        # Zone interaction MLP: (pickup_emb + dropoff_emb + pair_hash) -> zone_mlp_dim
-        zone_input_dim = c.zone_embed_dim * 2 + c.pair_embed_dim
+        # Zone interaction MLP:
+        # [pu_emb, do_emb, pu*do, pu-do, pair_hash] -> zone_mlp_dim
+        zone_input_dim = c.zone_embed_dim * 4 + c.pair_embed_dim
         self.zone_mlp = nn.Sequential(
             nn.Linear(zone_input_dim, c.zone_mlp_dim),
             nn.SiLU(),
@@ -137,8 +138,14 @@ class ETAModel(nn.Module):
         do_emb = self.embed_drop(self.dropoff_embed(dropoff_zone)) # (batch, 50)
         pair_emb = self.pair_hasher(pickup_zone, dropoff_zone)     # (batch, 16)
 
-        zone_features = torch.cat([pu_emb, do_emb, pair_emb], dim=1)  # (batch, 116)
-        zone_out = self.zone_mlp(zone_features)                        # (batch, 64)
+        # Element-wise interactions: similarity (product) and direction (difference)
+        emb_product = pu_emb * do_emb    # (batch, 50)
+        emb_diff = pu_emb - do_emb       # (batch, 50)
+
+        zone_features = torch.cat(
+            [pu_emb, do_emb, emb_product, emb_diff, pair_emb], dim=1,
+        )  # (batch, 216)
+        zone_out = self.zone_mlp(zone_features)  # (batch, zone_mlp_dim)
 
         # Continuous branch
         cont_normed = self.cont_bn(continuous)    # (batch, 19)
