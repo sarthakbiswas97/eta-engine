@@ -81,6 +81,7 @@ class ZonePairFeatures:
     do_mean: float
     pair_tb_mean: float
     pair_tb_median: float
+    pair_rarity: float  # 1/(1+log1p(count)) -- high for rare pairs, low for common
 
 
 def _compute_pair_stats(train_df: pd.DataFrame) -> pd.DataFrame:
@@ -333,6 +334,9 @@ def lookup(
             tb_mean = tb_data["tb_mean"]
             tb_median = tb_data["tb_median"]
 
+    log_count = math.log1p(count)
+    pair_rarity = 1.0 / (1.0 + log_count)
+
     return ZonePairFeatures(
         pair_mean_smoothed=pair_mean_sm,
         pair_median=pair_median,
@@ -341,12 +345,13 @@ def lookup(
         pair_p25=p25,
         pair_p75=p75,
         pair_iqr=p75 - p25,
-        log_pair_count=math.log1p(count),
+        log_pair_count=log_count,
         same_zone=same_zone,
         pu_mean=pu_mean,
         do_mean=do_mean,
         pair_tb_mean=tb_mean,
         pair_tb_median=tb_median,
+        pair_rarity=pair_rarity,
     )
 
 
@@ -426,10 +431,12 @@ def enrich_dataframe(df: pd.DataFrame, stats: dict[str, Any]) -> pd.DataFrame:
     df["pair_median"] = df["pair_median"].fillna(fallback)
 
     # Derived features
+    log_pair_count = np.log1p(df["pair_count"])
     df = df.assign(
         pair_iqr=df["pair_p75"] - df["pair_p25"],
-        log_pair_count=np.log1p(df["pair_count"]),
+        log_pair_count=log_pair_count,
         same_zone=(df["pickup_zone"] == df["dropoff_zone"]).astype(np.int8),
+        pair_rarity=1.0 / (1.0 + log_pair_count),
     )
 
     # Temporal zone-pair stats

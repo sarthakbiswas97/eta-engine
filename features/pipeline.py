@@ -50,6 +50,7 @@ ZONE_PAIR_CONTINUOUS = [
     "do_mean",
     "pair_tb_mean",
     "pair_tb_median",
+    "pair_rarity",
 ]
 
 CONTINUOUS_FEATURES = ZONE_PAIR_CONTINUOUS + TEMPORAL_COLUMNS
@@ -107,6 +108,7 @@ class FeaturePipeline:
             zp.do_mean,
             zp.pair_tb_mean,
             zp.pair_tb_median,
+            zp.pair_rarity,
         ]
 
         # Temporal
