@@ -21,14 +21,14 @@ class ModelConfig:
 
     num_zones: int = 266           # zone IDs 1-265, index 0 = padding/unknown
     zone_embed_dim: int = 50       # embedding dim per zone (pickup and dropoff separate)
-    pair_hash_buckets: int = 16384 # hash buckets for zone-pair embedding
+    pair_hash_buckets: int = 8192  # hash buckets for zone-pair embedding
     pair_embed_dim: int = 16       # embedding dim for hashed zone pair
-    n_continuous: int = 24         # number of continuous input features
+    n_continuous: int = 22         # number of continuous input features
     zone_mlp_dim: int = 128        # output dim of zone interaction MLP
     cont_mlp_dim: int = 128        # output dim of continuous branch
     hidden_dims: tuple[int, ...] = (256, 128)  # combined MLP residual block dims
-    dropout: float = 0.3
-    embed_dropout: float = 0.15
+    dropout: float = 0.15
+    embed_dropout: float = 0.1
 
 
 class ZonePairHasher(nn.Module):
