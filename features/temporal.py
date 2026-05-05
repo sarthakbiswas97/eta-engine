@@ -4,13 +4,12 @@ Extracts time-based features from ISO 8601 timestamps. All features are
 generic -- no domain-specific geography or location knowledge.
 
 Features:
-  - Cyclical encoding (sin/cos) for hour, day-of-week
+  - Cyclical encoding (sin/cos) for hour, day-of-week, month
   - Normalized minute-of-day (0-1)
   - Binary flags: is_weekend, is_rush_hour, is_night
 
-Removed (constant in dev/eval date ranges):
-  - month_sin, month_cos (dev = all Dec, eval = winter holidays)
-  - day_of_month (2-week slices have near-zero variance)
+Removed (near-zero variance in dev/eval date ranges):
+  - day_of_month (2-week slices have std=0.04)
 """
 
 from __future__ import annotations
@@ -33,6 +32,8 @@ class TemporalFeatures:
     hour_cos: float
     dow_sin: float
     dow_cos: float
+    month_sin: float
+    month_cos: float
     minute_of_day: float
     is_weekend: int
     is_rush_hour: int
@@ -45,6 +46,7 @@ def extract_single(requested_at: str) -> TemporalFeatures:
 
     hour_frac = (ts.hour + ts.minute / 60.0) / 24.0
     dow_frac = ts.weekday() / 7.0
+    month_frac = (ts.month - 1) / 12.0
 
     is_wknd = 1 if ts.weekday() >= 5 else 0
     is_rush = 1 if (not is_wknd and (7 <= ts.hour <= 9 or 16 <= ts.hour <= 19)) else 0
@@ -55,6 +57,8 @@ def extract_single(requested_at: str) -> TemporalFeatures:
         hour_cos=math.cos(_TWO_PI * hour_frac),
         dow_sin=math.sin(_TWO_PI * dow_frac),
         dow_cos=math.cos(_TWO_PI * dow_frac),
+        month_sin=math.sin(_TWO_PI * month_frac),
+        month_cos=math.cos(_TWO_PI * month_frac),
         minute_of_day=(ts.hour * 60 + ts.minute) / 1439.0,
         is_weekend=is_wknd,
         is_rush_hour=is_rush,
@@ -72,6 +76,7 @@ def enrich_dataframe(df: pd.DataFrame) -> pd.DataFrame:
 
     hour_frac = (ts.dt.hour + ts.dt.minute / 60.0) / 24.0
     dow_frac = ts.dt.dayofweek / 7.0
+    month_frac = (ts.dt.month - 1) / 12.0
 
     is_weekend = (ts.dt.dayofweek >= 5).astype(np.int8)
 
@@ -80,6 +85,8 @@ def enrich_dataframe(df: pd.DataFrame) -> pd.DataFrame:
         hour_cos=np.cos(_TWO_PI * hour_frac),
         dow_sin=np.sin(_TWO_PI * dow_frac),
         dow_cos=np.cos(_TWO_PI * dow_frac),
+        month_sin=np.sin(_TWO_PI * month_frac),
+        month_cos=np.cos(_TWO_PI * month_frac),
         minute_of_day=(ts.dt.hour * 60 + ts.dt.minute) / 1439.0,
         is_weekend=is_weekend,
         is_rush_hour=((~is_weekend.astype(bool)) & ((ts.dt.hour >= 7) & (ts.dt.hour <= 9) | (ts.dt.hour >= 16) & (ts.dt.hour <= 19))).astype(np.int8),
@@ -90,6 +97,7 @@ def enrich_dataframe(df: pd.DataFrame) -> pd.DataFrame:
 FEATURE_COLUMNS = [
     "hour_sin", "hour_cos",
     "dow_sin", "dow_cos",
+    "month_sin", "month_cos",
     "minute_of_day",
     "is_weekend", "is_rush_hour", "is_night",
 ]
