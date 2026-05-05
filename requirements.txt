@@ -2,5 +2,6 @@ pandas>=2.0,<3
 numpy>=1.24,<3
 pyarrow>=14,<25
 torch>=2.0
+lightgbm>=4.0
 tqdm>=4.66,<5
 pytest>=7.4,<10

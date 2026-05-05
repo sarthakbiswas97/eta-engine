@@ -23,6 +23,7 @@ COPY model/ ./model/
 # Copy submission surface + trained weights + artifacts
 COPY predict.py grade.py ./
 COPY model.pt ./
+COPY lgbm_model.txt ./
 COPY data/zone_pair_stats/zone_pair_stats.pkl ./data/zone_pair_stats/zone_pair_stats.pkl
 
 # Grader invokes:  python grade.py <input.parquet> <output.csv>

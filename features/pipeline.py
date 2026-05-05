@@ -83,7 +83,25 @@ class FeaturePipeline:
 
         Returns:
             cat: shape (2,) int32 -- [pickup_zone, dropoff_zone]
-            cont: shape (n_continuous,) float32 -- continuous features
+            cont: shape (n_continuous,) float32 -- normalized continuous features
+        """
+        cat, cont = self.transform_single_raw(request)
+
+        # Normalize if stats are fitted
+        if self._cont_means is not None:
+            cont = (cont - self._cont_means) / self._cont_stds
+
+        return cat, cont
+
+    def transform_single_raw(self, request: dict) -> tuple[np.ndarray, np.ndarray]:
+        """Transform a single request into (categorical, raw continuous) arrays.
+
+        Same as transform_single but without normalization. Used by LightGBM
+        which is scale-invariant.
+
+        Returns:
+            cat: shape (2,) int32 -- [pickup_zone, dropoff_zone]
+            cont: shape (n_continuous,) float32 -- raw (unnormalized) features
         """
         pickup_zone = int(request["pickup_zone"])
         dropoff_zone = int(request["dropoff_zone"])
@@ -116,11 +134,6 @@ class FeaturePipeline:
         tf_values = [getattr(tf, col) for col in TEMPORAL_COLUMNS]
 
         cont = np.array(zp_values + tf_values, dtype=np.float32)
-
-        # Normalize if stats are fitted
-        if self._cont_means is not None:
-            cont = (cont - self._cont_means) / self._cont_stds
-
         return cat, cont
 
     def transform_dataframe(
