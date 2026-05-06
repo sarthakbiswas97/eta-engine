@@ -139,6 +139,13 @@ def main() -> None:
     gc.collect()
 
     # Train
+    # Auto-detect GPU
+    try:
+        import torch
+        has_gpu = torch.cuda.is_available()
+    except ImportError:
+        has_gpu = False
+
     params = {
         "objective": "mae",
         "metric": "mae",
@@ -152,6 +159,10 @@ def main() -> None:
         "seed": SEED,
         "num_threads": -1,
     }
+
+    if has_gpu:
+        params["device"] = "gpu"
+        logger.info("Using GPU for LightGBM training")
 
     logger.info("Training LightGBM: %s", params)
     t0 = time.time()
