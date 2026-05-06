@@ -22,10 +22,11 @@ data itself via embeddings, not from external geography (no shapefiles, no
 hardcoded coordinates). If the zone IDs mapped to a different city, the model
 would learn equally well given the same trip patterns.
 
-### Architecture (v3)
+### Architecture: NN + LightGBM Ensemble
 
-Tabular neural net with learned zone embeddings, engineered features, and
-residual connections. Trained on ~37M NYC yellow taxi trips from 2023.
+Two models with complementary strengths, blended 50/50 at inference.
+
+**Model 1: Tabular Neural Net (560k params)**
 
 ```
 Zone Branch:
@@ -43,17 +44,32 @@ Combined:
              -> Linear(64) -> SiLU -> Linear(1)
 ```
 
-**559,897 trainable parameters.**
+Trained on full 37M rows with Huber loss, OneCycleLR, GPU. High precision
+but systematic underprediction bias (-106s) on rare/long trips.
+
+**Model 2: LightGBM (81 trees, 2.4 MB)**
+
+Gradient-boosted tree on same 24 features + zone IDs as native categoricals.
+Trained on 10M rows with MAE objective. Near-zero bias (-6s) because trees
+partition the feature space directly rather than interpolating through
+embeddings.
+
+**Ensemble:** `pred = 0.5 * nn_pred + 0.5 * lgbm_pred`
+
+The NN excels at smooth interpolation for common routes; LightGBM excels at
+rare/unusual routes where zone-pair statistics are sparse. Blending averages
+out the NN's bias while keeping both models' precision.
 
 **Feature groups (26 total):**
 
-1. **Zone-pair statistics (13 features)** -- precomputed mean, median, std,
+1. **Zone-pair statistics (14 features)** -- precomputed mean, median, std,
    p25, p75, IQR, trip count per (pickup, dropoff) pair with Bayesian
    shrinkage for sparse pairs. Time-bucketed mean/median (6 time-of-day
-   buckets). Fallback hierarchy: pair -> pickup-zone -> dropoff-zone -> global.
-2. **Temporal features (11 features)** -- cyclical sin/cos encoding for hour,
+   buckets). Pair rarity signal (1/(1+log1p(count))) for rare-pair awareness.
+   Fallback hierarchy: pair -> pickup-zone -> dropoff-zone -> global.
+2. **Temporal features (10 features)** -- cyclical sin/cos encoding for hour,
    day-of-week, month. Binary flags for weekend, rush hour, night. Normalized
-   minute-of-day and day-of-month.
+   minute-of-day.
 3. **Zone embeddings (2 categorical)** -- separate learned embeddings for
    pickup and dropoff zones (dim=50 each), plus element-wise product
    (similarity) and difference (directionality), plus a hash-based zone-pair
@@ -63,16 +79,19 @@ Combined:
 
 ## Results
 
-| Method | Dev MAE | Params | vs XGBoost |
-|--------|---------|--------|------------|
-| Predict global mean | ~580 s | -- | -- |
-| XGBoost baseline (6 features) | 351.0 s | -- | -- |
-| Zone-pair smoothed mean | 302.7 s | -- | -14% |
-| Zone-pair median | 296.7 s | -- | -15% |
-| Zone-pair time-bucketed mean | 277.9 s | -- | -21% |
-| Neural net v1 (L1, 19 features) | 272.1 s | 372k | -22% |
-| Neural net v2 (Huber, 24 features) | 266.2 s | 373k | -24% |
-| **Neural net v3 (residual, Huber)** | **264.5 s** | **560k** | **-25%** |
+| Method | Dev MAE | Notes |
+|--------|---------|-------|
+| Predict global mean | ~580 s | -- |
+| XGBoost baseline (6 features) | 351.0 s | Challenge baseline |
+| Zone-pair smoothed mean | 302.7 s | Statistics only |
+| Zone-pair median | 296.7 s | Statistics only |
+| Zone-pair time-bucketed mean | 277.9 s | Statistics only |
+| Neural net v1 (L1, 19 features) | 272.1 s | 372k params |
+| Neural net v2 (Huber, 24 features) | 266.2 s | +temporal zone-pair stats |
+| Neural net v3 (residual, Huber) | 264.5 s | +embedding interactions |
+| Neural net v4b | 264.3 s | Lower dropout, pair_rarity |
+| LightGBM (81 trees, MAE) | 263.1 s | 10M rows, 2.4 MB |
+| **NN + LightGBM ensemble** | **254.0 s** | **alpha=0.50, -28% vs XGBoost** |
 
 ---
 
@@ -266,42 +285,44 @@ python grade.py
 
 ## What Worked
 
+- **NN + LightGBM ensemble (biggest win: -7.2s):** The two models make
+  complementary errors. NN underpredicts rare/long trips (bias -106s); LGBM
+  has near-zero bias (-6s). Blending gives best of both worlds.
 - **Zone-pair statistics as features:** Zone-pair median alone (296.7s) beats
   XGBoost (351s) with zero ML. Bayesian shrinkage handles sparse pairs.
+- **LightGBM with native categoricals:** Trees handle zone IDs directly via
+  splits. No embedding needed. Better for rare pairs by design.
 - **Learned zone embeddings:** The neural net learns spatial relationships
   purely from trip patterns. No external geography needed.
 - **Element-wise embedding interactions:** Product captures zone similarity,
   difference captures trip directionality (A->B vs B->A).
-- **Residual blocks:** Better gradient flow through deeper combined MLP,
-  enabling the model to learn more complex feature interactions.
-- **Huber loss (delta=300):** Reduced underprediction bias on long trips
-  compared to L1, without the outlier sensitivity of L2.
+- **Deep diagnostics before tuning:** Parameter health, rare-pair analysis,
+  and regularization checks revealed the true bottleneck (rare-pair bias) and
+  prevented wasted experiments on architecture changes.
 - **OneCycleLR with warmup:** Stable training from step 1. Avoids NaN
   gradients on randomly initialized embeddings.
 - **Chunked data processing:** 37M rows in 2M chunks keeps memory under 6GB,
-  enabling training on free-tier Colab/Kaggle (12-16GB RAM).
-- **MLflow experiment tracking:** All runs logged with hyperparameters,
-  metrics, and artifacts. Archived to HF Hub for persistence.
+  enabling training on free-tier Kaggle (13GB RAM).
 
 ## What Didn't Work
 
+- **Reducing hash buckets (16k -> 8k):** 13s regression. Hash embeddings at
+  47% of params are critical -- too many collisions destroys pair-level signal.
+- **Removing month features:** 13s regression. Even though constant in dev/eval,
+  month_sin/cos help the model distinguish seasonal patterns during training.
+- **Log-target + Huber loss:** Huber(delta=300) in log-space is pure MSE since
+  log-space errors never exceed 6. Loss/metric mismatch.
 - **Training on small samples (500k rows):** Converged to ~945s MAE.
   Embeddings need the full 37M rows to learn meaningful zone relationships.
-- **CosineAnnealingLR without warmup:** NaN loss in epoch 1 due to unstable
-  gradients on random embeddings.
-- **Temporal zone-pair features (diminishing returns):** Standalone tb_mean
-  achieves 277.9s, but only added ~6s to the neural net -- the model already
-  learns temporal-zone interactions implicitly via embeddings.
-- **Wider architecture alone:** Going from 372k to 560k parameters gave only
-  1.7s improvement. The model overfits after epoch 5 regardless of size.
+- **Architecture tuning past v3:** Dropout reduction, pair_rarity feature, and
+  various configs all landed at 264s. The NN ceiling is structural.
 
 ## Next Steps
 
-- L1 vs Huber A/B test (same v3 architecture)
-- Reduced hash buckets (16k -> 8k) to cut parameter count
-- LightGBM ensemble
-- Hyperparameter sweep (embedding dim, learning rate, batch size)
-- Final submission packaging (Dockerfile, writeup)
+- Post-hoc bias correction / prediction rescaling (2-5s potential)
+- FT-Transformer exploration (tabular transformer)
+- Larger LGBM (full 37M rows, more trees)
+- Final submission packaging (Dockerfile, README writeup)
 
 ---
 

@@ -24,7 +24,7 @@ _STATS_PATH = _ROOT / "data" / "zone_pair_stats" / "zone_pair_stats.pkl"
 
 # Ensemble weight: pred = ALPHA * nn + (1 - ALPHA) * lgbm
 # Set to 1.0 to use NN only (fallback if no LGBM model present)
-_ENSEMBLE_ALPHA = 0.6
+_ENSEMBLE_ALPHA = 0.50
 
 # --- Load NN model ---
 _checkpoint = torch.load(_MODEL_PATH, map_location="cpu", weights_only=False)
