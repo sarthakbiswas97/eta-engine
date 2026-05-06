@@ -317,11 +317,18 @@ python grade.py
 - **Architecture tuning past v3:** Dropout reduction, pair_rarity feature, and
   various configs all landed at 264s. The NN ceiling is structural.
 
+## What Was Tried But Didn't Help
+
+- **Prediction rescaling (scale=1.04):** Only -0.8s gain. Overfitting risk on
+  eval outweighs negligible improvement.
+- **LGBM on full 37M rows:** Worse than 10M subsample (267-273s vs 263s).
+  More data includes more outlier trips that dilute tree splits.
+- **Bias offset correction:** Only -0.4s. Systematic bias (-55s) is too
+  interleaved with real prediction errors to correct post-hoc.
+
 ## Next Steps
 
-- Post-hoc bias correction / prediction rescaling (2-5s potential)
-- FT-Transformer exploration (tabular transformer)
-- Larger LGBM (full 37M rows, more trees)
+- FT-Transformer (tabular transformer as third ensemble member)
 - Final submission packaging (Dockerfile, README writeup)
 
 ---
