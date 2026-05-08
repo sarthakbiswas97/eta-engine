@@ -28,7 +28,7 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import OneCycleLR
 
 from features.pipeline import FeaturePipeline
-from model.ft_transformer import FTTransformer, FTConfig
+from model.ft_transformer import FTTransformer, FTConfig, FTConfigSmall
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -200,6 +200,7 @@ def main() -> None:
     parser.add_argument("--save-every", type=int, default=2, help="Checkpoint every N epochs")
     parser.add_argument("--loss", type=str, default="l1", choices=["l1", "huber", "mse"], help="Loss function")
     parser.add_argument("--run-name", type=str, default=None, help="MLflow run name")
+    parser.add_argument("--small", action="store_true", help="Use FTConfigSmall (d=96, 2 layers, 4 heads)")
     parser.add_argument("--num-workers", type=int, default=2, help="DataLoader workers")
     args = parser.parse_args()
 
@@ -254,7 +255,11 @@ def main() -> None:
     logger.info("Dev: %s rows, %d batches", f"{len(dev_ds):,}", len(dev_loader))
 
     # Model
-    config = FTConfig(n_numerical=train_cont.shape[1])
+    if args.small:
+        config = FTConfigSmall(n_numerical=train_cont.shape[1])
+        logger.info("Using FTConfigSmall (d=%d, %d layers, %d heads)", config.d_token, config.n_blocks, config.n_heads)
+    else:
+        config = FTConfig(n_numerical=train_cont.shape[1])
     model = FTTransformer(config).to(device)
     logger.info("FT-Transformer parameters: %s", f"{model.count_parameters():,}")
 
