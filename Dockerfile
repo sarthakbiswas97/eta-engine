@@ -24,7 +24,9 @@ COPY model/ ./model/
 COPY predict.py grade.py ./
 COPY model.pt ./
 COPY lgbm_model.txt ./
-COPY ft_model.pt ./
+COPY ft_model.onnx ./
+COPY ft_model.onnx.data ./
+COPY ft_norm_params.npz ./
 COPY data/zone_pair_stats/zone_pair_stats.pkl ./data/zone_pair_stats/zone_pair_stats.pkl
 
 # Grader invokes:  python grade.py <input.parquet> <output.csv>
