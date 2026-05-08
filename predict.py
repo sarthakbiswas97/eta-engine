@@ -22,9 +22,6 @@ import torch
 from features.pipeline import FeaturePipeline
 from model.architecture import ETAModel, ModelConfig
 
-# Reduce thread overhead for single-sample inference
-torch.set_num_threads(1)
-
 _ROOT = Path(__file__).parent
 _MODEL_PATH = _ROOT / "model.pt"
 _LGBM_PATH = _ROOT / "lgbm_model.txt"
