@@ -38,6 +38,31 @@ class FTConfig:
     residual_dropout: float = 0.0
 
 
+@dataclass(frozen=True)
+class FTConfigSmall:
+    """Optimized FT-Transformer for faster inference.
+
+    Changes from FTConfig:
+      - d_token: 128 -> 96  (attention is O(d^2), saves 44% FLOPs)
+      - n_blocks: 3 -> 2    (saves 33% compute, 2 layers sufficient for 27 tokens)
+      - n_heads: 8 -> 4     (32-dim per head, richer per-head representations)
+      - ffn_multiplier: 1.33 -> 1.0 (FFN same width as d_token, saves 25% FFN FLOPs)
+
+    Expected: ~105k params (vs 406k), ~2M FLOPs (vs 10M), <1.5ms ONNX inference.
+    """
+
+    n_numerical: int = 24
+    n_categorical: int = 2
+    cat_cardinalities: tuple[int, ...] = (266, 266)
+    d_token: int = 96
+    n_blocks: int = 2
+    n_heads: int = 4
+    ffn_multiplier: float = 1.0
+    attention_dropout: float = 0.2
+    ffn_dropout: float = 0.1
+    residual_dropout: float = 0.0
+
+
 class NumericalTokenizer(nn.Module):
     """Project each numerical feature into a d_token-dimensional token.
 
