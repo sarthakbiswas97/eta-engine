@@ -22,11 +22,15 @@ data itself via embeddings, not from external geography (no shapefiles, no
 hardcoded coordinates). If the zone IDs mapped to a different city, the model
 would learn equally well given the same trip patterns.
 
-### Architecture: NN + LightGBM Ensemble
+### Architecture: 3-Model Ensemble
 
-Two models with complementary strengths, blended 50/50 at inference.
+Three models with complementary strengths, weighted at inference:
 
-**Model 1: Tabular Neural Net (560k params)**
+```
+pred = 0.6 * NN + 0.2 * LightGBM + 0.2 * FT-Transformer
+```
+
+**Model 1: Tabular Neural Net (560k params, 2.3 MB)**
 
 ```
 Zone Branch:
@@ -44,29 +48,56 @@ Combined:
              -> Linear(64) -> SiLU -> Linear(1)
 ```
 
-Trained on full 37M rows with Huber loss, OneCycleLR, GPU. High precision
-but systematic underprediction bias (-106s) on rare/long trips.
+Trained on full 37M rows with Huber loss, OneCycleLR, Kaggle T4 GPU. Best at
+smooth interpolation for common routes. Systematic underprediction bias
+(-106s) on rare/long trips.
 
 **Model 2: LightGBM (81 trees, 2.4 MB)**
 
 Gradient-boosted tree on same 24 features + zone IDs as native categoricals.
 Trained on 10M rows with MAE objective. Near-zero bias (-6s) because trees
 partition the feature space directly rather than interpolating through
-embeddings.
+embeddings. Complements the NN on rare zone pairs.
 
-**Ensemble:** `pred = 0.5 * nn_pred + 0.5 * lgbm_pred`
+**Model 3: FT-Transformer (406k params, 1.6 MB)**
 
-The NN excels at smooth interpolation for common routes; LightGBM excels at
-rare/unusual routes where zone-pair statistics are sparse. Blending averages
-out the NN's bias while keeping both models' precision.
+Feature Tokenizer Transformer (Gorishniy et al., NeurIPS 2021), implemented
+from scratch. Each feature is projected into a 128-dim token; a [CLS] token
+aggregates information via 3-layer self-attention. Captures cross-feature
+interactions that the MLP's hand-designed branches miss.
+
+```
+24 numerical features -> NumericalTokenizer (24 independent Linear(1,128))
+2 zone IDs            -> CategoricalTokenizer (2 independent Embedding(266,128))
+[CLS]                 -> learnable parameter
+
+[CLS, feat_0, ..., feat_25] = 27 tokens x 128-dim
+    -> TransformerEncoder(3 layers, 8 heads, pre-norm, GELU)
+    -> CLS output -> LayerNorm -> Linear(128, 1)
+```
+
+Trained on 10M rows with L1 loss. Positive bias (+65s) offsets the NN's
+negative bias, improving ensemble diversity.
+
+**Why ensemble works:**
+
+| Model | Dev MAE | Bias | Strength |
+|-------|---------|------|----------|
+| NN | 261.2s | -106s | Precision on common routes |
+| LGBM | 261.7s | -6s | Rare pairs, low bias |
+| FT | 284.7s | +65s | Different error pattern, bias offset |
+| **Ensemble** | **252.7s** | **-42s** | **Best of all three** |
+
+Error correlation between NN and LGBM: 0.938 (moderate decorrelation).
+Combined inference: <5ms per request on CPU.
 
 **Feature groups (26 total):**
 
 1. **Zone-pair statistics (14 features)** -- precomputed mean, median, std,
    p25, p75, IQR, trip count per (pickup, dropoff) pair with Bayesian
    shrinkage for sparse pairs. Time-bucketed mean/median (6 time-of-day
-   buckets). Pair rarity signal (1/(1+log1p(count))) for rare-pair awareness.
-   Fallback hierarchy: pair -> pickup-zone -> dropoff-zone -> global.
+   buckets). Pair rarity signal for rare-pair awareness. Fallback hierarchy:
+   pair -> pickup-zone -> dropoff-zone -> global.
 2. **Temporal features (10 features)** -- cyclical sin/cos encoding for hour,
    day-of-week, month. Binary flags for weekend, rush hour, night. Normalized
    minute-of-day.
@@ -91,7 +122,9 @@ out the NN's bias while keeping both models' precision.
 | Neural net v3 (residual, Huber) | 264.5 s | +embedding interactions |
 | Neural net v4b | 264.3 s | Lower dropout, pair_rarity |
 | LightGBM (81 trees, MAE) | 263.1 s | 10M rows, 2.4 MB |
-| **NN + LightGBM ensemble** | **254.0 s** | **alpha=0.50, -28% vs XGBoost** |
+| FT-Transformer (L1, 10M rows) | 287.1 s | 406k params, attention-based |
+| NN + LightGBM (2-model) | 254.0 s | alpha=0.50/0.50 |
+| **NN + LGBM + FT (3-model)** | **252.7 s** | **0.60/0.20/0.20, -28% vs baseline** |
 
 ---
 
@@ -108,94 +141,68 @@ signal is the pickup-dropoff pair. A neural net can learn nonlinear
 interactions between zone embeddings and temporal features that simple
 statistics miss.
 
-| Epoch | Train Loss | Dev MAE |
-|-------|-----------|---------|
-| 1 | 968.5 | 858.7 s |
-| 2 | 669.0 | 414.5 s |
-| 3 | 281.8 | 275.2 s |
-| 4 | 245.3 | **272.1 s** |
-| 5 | 241.9 | 273.9 s |
-| 6 | 239.9 | 272.4 s |
-| 7 | 238.9 | 274.6 s |
-
-**Result:** 272.1s (epoch 4, early stopped at 7). Train-dev gap of ~33s
-indicates moderate overfitting.
-
-**Takeaway:** Most learning happens in epochs 2-3 as embeddings lock onto
-zone-pair patterns. After that, diminishing returns. Error analysis revealed
+**Result:** 272.1s (epoch 4, early stopped at 7). Error analysis revealed
 systematic underprediction on long trips (-970s bias for 2400s+ trips).
 
 ---
 
 ### v2: Temporal Features + Huber Loss
 
-**What changed:**
-- 5 new features (19 -> 24): time-bucketed zone-pair mean/median (6 time-of-day
-  buckets with Bayesian shrinkage), pair IQR, log trip count, same-zone flag
-- Huber loss (delta=300) instead of L1: L2 penalty for errors < 300s, L1 for
-  larger errors
+**What changed:** 5 new features (temporal zone-pair mean/median, pair IQR,
+log count, same-zone flag) + Huber loss (delta=300).
 
-**Why:** Error analysis of v1 showed the same zone pair varies 2.2x by time of
-day (e.g., zone 237->236: 251s at 5AM vs 552s at 2PM). Temporal zone-pair
-stats capture this. Huber loss addresses the long-trip underprediction bias by
-penalizing large errors less aggressively than L2 but more than L1.
+**Why:** Same zone pair varies 2.2x by time of day. Huber addresses long-trip
+underprediction bias.
 
-| Epoch | Train Loss | Dev MAE |
-|-------|-----------|---------|
-| 1 | 246048.6 | 923.5 s |
-| 2 | 156510.2 | 394.5 s |
-| 3 | 50746.7 | 270.8 s |
-| 4 | 41775.0 | 270.3 s |
-| 5 | 40995.2 | **266.2 s** |
-| 6 | 40563.6 | 269.0 s |
-| 7 | 40314.5 | 270.9 s |
-| 8 | 40164.9 | 270.4 s |
-
-**Result:** 266.2s (epoch 5, early stopped at 8). 6s improvement over v1.
-
-**Takeaway:** Temporal features helped but less than expected -- the model may
-already learn temporal-zone interactions via embeddings. The plateau at ~266s
-suggested architecture was the bottleneck, not features.
+**Result:** 266.2s (epoch 5). 6s improvement, but architecture plateau.
 
 ---
 
 ### v3: Residual Architecture + Embedding Interactions
 
-**What changed:**
-- Element-wise product (`pu * do`) captures zone similarity (zones that
-  co-occur in similar trip patterns get similar embeddings, so their product
-  is large)
-- Element-wise difference (`pu - do`) captures directionality (A->B vs B->A
-  have opposite signs)
-- Deeper zone interaction MLP (2 layers instead of 1)
-- Wider continuous branch (128-dim instead of 64-dim)
-- Residual blocks in combined MLP for better gradient flow
-- Higher dropout (0.3) and embed dropout (0.15)
-- Parameters: 372k -> 560k
+**What changed:** Element-wise product/difference of zone embeddings, deeper
+zone MLP, residual blocks in combined MLP, wider continuous branch. 372k ->
+560k params.
 
-**Why:** v2 plateaued at 266s despite strong features, suggesting the
-architecture couldn't fully exploit the inputs. Residual connections help
-deeper networks train stably. Embedding interactions provide explicit
-similarity/direction signals without the model needing to learn them from
-scratch.
+**Why:** v2 plateaued at 266s despite strong features -- architecture was the
+bottleneck.
 
-| Epoch | Train Loss | Dev MAE |
-|-------|-----------|---------|
-| 1 | 94684.9 | 300.8 s |
-| 2 | 41304.7 | 279.7 s |
-| 3 | 39168.2 | 272.3 s |
-| 4 | 38266.6 | 268.7 s |
-| 5 | 37758.8 | **264.5 s** |
-| 6 | 37414.8 | 268.2 s |
-| 7 | 37193.0 | 269.3 s |
-| 8 | 37054.8 | 271.2 s |
+**Result:** 264.5s (epoch 5). 1.7s improvement. Confirmed diminishing returns
+on architecture changes alone.
 
-**Result:** 264.5s (epoch 5, early stopped at 8). 1.7s improvement over v2.
+---
 
-**Takeaway:** Architecture changes gave modest gains. The residual blocks
-helped stabilize deeper training, but the model still plateaus after epoch 5.
-Train loss continues dropping while dev MAE rises -- classic overfitting
-signal. Next steps: L1 vs Huber A/B test, reduced hash buckets.
+### v4: Diagnostic-Driven Tuning
+
+**What:** Deep diagnostic analysis (parameter health, rare-pair behavior,
+feature sparsity, regularization effectiveness). Led to:
+- Lower dropout (0.3 -> 0.15): reduced 66s prediction noise
+- pair_rarity feature: signals when zone-pair stats are unreliable
+- Confirmed NN ceiling at ~264s
+
+**Failed experiments:**
+- Hash bucket reduction (16k -> 8k): 13s regression
+- Month feature removal: 13s regression (training needs seasonal signal)
+- Log-target + Huber: loss/metric mismatch in log-space
+
+---
+
+### Ensemble: Breaking the NN Ceiling
+
+**Insight:** Diagnostic showed NN's -106s bias was driven by rare zone pairs
+(MAE 400-926s for pairs with <100 training trips). No amount of NN tuning
+could fix this -- embeddings interpolate, and rare pairs have nothing to
+interpolate from.
+
+**LightGBM** solved this: trees use zone IDs as native categoricals, partitioning
+the space directly. Bias dropped from -106s to -6s.
+
+**FT-Transformer** added further diversity: its positive bias (+65s) partially
+offsets the NN's negative bias, and self-attention discovers cross-feature
+interactions without hand-designed branches.
+
+**Ensemble optimization:** Grid search over weights on full 1.23M dev set.
+Best: NN=0.6, LGBM=0.2, FT=0.2.
 
 ---
 
@@ -211,22 +218,6 @@ xychart-beta
     line [300.8, 279.7, 272.3, 268.7, 264.5, 268.2, 269.3, 271.2]
 ```
 
-```mermaid
-xychart-beta
-    title "Dev MAE (Zoomed: Epochs 3-8)"
-    x-axis "Epoch" [3, 4, 5, 6, 7, 8]
-    y-axis "Dev MAE (seconds)" 260 --> 280
-    line [275.2, 272.1, 273.9, 272.4, 274.6, 274.6]
-    line [270.8, 270.3, 266.2, 269.0, 270.9, 270.4]
-    line [272.3, 268.7, 264.5, 268.2, 269.3, 271.2]
-```
-
-**Key observations from the curves:**
-- All versions converge rapidly (epochs 1-3), then plateau
-- v3 starts lower (300.8 vs 858/923) due to better architecture initialization
-- The convergence gap narrows with each version: diminishing returns on architecture alone
-- All versions show dev MAE rising after epoch 5 -- overfitting window is consistent
-
 ---
 
 ## Project Structure
@@ -234,21 +225,31 @@ xychart-beta
 ```
 .
 ├── CHALLENGE.md              # Original challenge README (reference)
-├── SUBMISSION_TEMPLATE.md    # Writeup template for final submission
+├── SUBMISSION_TEMPLATE.md    # Submission writeup
 ├── baseline.py               # Original XGBoost baseline (reference)
-├── predict.py                # Submission interface (grader imports this)
+├── predict.py                # Submission interface (3-model ensemble)
 ├── grade.py                  # Local scoring harness
-├── train.py                  # Training script (GPU, MLflow tracked)
+├── train.py                  # MLP training script (GPU, MLflow)
 ├── Dockerfile                # Submission packaging
 ├── requirements.txt          # Python dependencies
+├── model.pt                  # Trained MLP weights (560k params)
+├── lgbm_model.txt            # Trained LightGBM (81 trees)
+├── ft_model.pt               # Trained FT-Transformer (406k params)
 ├── features/                 # Feature engineering modules
-│   ├── zone_pair_stats.py    # Zone-pair statistical features
+│   ├── zone_pair_stats.py    # Zone-pair statistics with Bayesian shrinkage
 │   ├── temporal.py           # Temporal feature extraction
 │   └── pipeline.py           # Unified feature pipeline
-├── model/                    # Neural network
-│   ├── architecture.py       # ETAModel definition
+├── model/                    # Model architectures
+│   ├── architecture.py       # ETAModel (MLP with embeddings)
+│   ├── ft_transformer.py     # FT-Transformer (from scratch)
 │   └── dataset.py            # PyTorch Dataset/DataLoader
-├── scripts/
+├── scripts/                  # Training and analysis scripts
+│   ├── train_lgbm.py         # LightGBM training
+│   ├── train_ft.py           # FT-Transformer training
+│   ├── find_ensemble_weight.py  # Ensemble weight optimization
+│   ├── find_rescaling.py     # Prediction rescaling analysis
+│   ├── train_dev_gap.py      # Train vs dev gap analysis
+│   ├── diagnose.py           # Model diagnostics
 │   └── upload_data_hf.py     # Push data to HF Hub
 ├── notebooks/
 │   └── train_gpu.ipynb       # Colab/Kaggle training notebook
@@ -274,68 +275,63 @@ python data/download_data.py
 # Compute zone-pair stats
 python -m features.zone_pair_stats
 
-# Train (GPU recommended, or use notebooks/train_gpu.ipynb on Colab/Kaggle)
-python train.py --epochs 10 --batch-size 8192 --lr 5e-4 --loss huber --run-name v3
+# Train all three models (GPU recommended, or use notebooks/train_gpu.ipynb)
+python train.py --epochs 10 --batch-size 8192 --lr 5e-4 --loss huber --run-name v4b
+python scripts/train_lgbm.py --sample 10000000 --run-name lgbm-v1
+python scripts/train_ft.py --sample 10000000 --epochs 15 --batch-size 2048 --lr 3e-4 --loss l1 --run-name ft-v3
 
-# Score on dev set
+# Score on dev set (uses ensemble predict.py)
 python grade.py
+
+# Docker build and test
+docker build -t my-eta .
+docker run --rm -v $(pwd)/data:/work my-eta /work/dev.parquet /work/preds.csv
 ```
 
 ---
 
 ## What Worked
 
-- **NN + LightGBM ensemble (biggest win: -7.2s):** The two models make
-  complementary errors. NN underpredicts rare/long trips (bias -106s); LGBM
-  has near-zero bias (-6s). Blending gives best of both worlds.
+- **3-model ensemble (biggest win):** NN + LightGBM + FT-Transformer. Each
+  model has a different inductive bias (embeddings vs tree splits vs
+  attention). Ensemble reduced MAE from 261s to 253s.
 - **Zone-pair statistics as features:** Zone-pair median alone (296.7s) beats
   XGBoost (351s) with zero ML. Bayesian shrinkage handles sparse pairs.
-- **LightGBM with native categoricals:** Trees handle zone IDs directly via
-  splits. No embedding needed. Better for rare pairs by design.
-- **Learned zone embeddings:** The neural net learns spatial relationships
-  purely from trip patterns. No external geography needed.
-- **Element-wise embedding interactions:** Product captures zone similarity,
-  difference captures trip directionality (A->B vs B->A).
+- **LightGBM with native categoricals:** Trees handle zone IDs directly.
+  Near-zero bias (-6s) on rare pairs where NN struggles (-106s bias).
+- **FT-Transformer from scratch:** Self-attention discovers cross-feature
+  interactions automatically. Positive bias (+65s) offsets NN's negative bias.
 - **Deep diagnostics before tuning:** Parameter health, rare-pair analysis,
   and regularization checks revealed the true bottleneck (rare-pair bias) and
   prevented wasted experiments on architecture changes.
-- **OneCycleLR with warmup:** Stable training from step 1. Avoids NaN
-  gradients on randomly initialized embeddings.
+- **Element-wise embedding interactions:** Product captures zone similarity,
+  difference captures trip directionality.
 - **Chunked data processing:** 37M rows in 2M chunks keeps memory under 6GB,
   enabling training on free-tier Kaggle (13GB RAM).
+- **MLflow experiment tracking:** All runs logged with hyperparameters,
+  metrics, and artifacts.
 
 ## What Didn't Work
 
 - **Reducing hash buckets (16k -> 8k):** 13s regression. Hash embeddings at
-  47% of params are critical -- too many collisions destroys pair-level signal.
-- **Removing month features:** 13s regression. Even though constant in dev/eval,
-  month_sin/cos help the model distinguish seasonal patterns during training.
-- **Log-target + Huber loss:** Huber(delta=300) in log-space is pure MSE since
-  log-space errors never exceed 6. Loss/metric mismatch.
-- **Training on small samples (500k rows):** Converged to ~945s MAE.
-  Embeddings need the full 37M rows to learn meaningful zone relationships.
-- **Architecture tuning past v3:** Dropout reduction, pair_rarity feature, and
-  various configs all landed at 264s. The NN ceiling is structural.
-
-## What Was Tried But Didn't Help
-
-- **Prediction rescaling (scale=1.04):** Only -0.8s gain. Overfitting risk on
-  eval outweighs negligible improvement.
-- **LGBM on full 37M rows:** Worse than 10M subsample (267-273s vs 263s).
-  More data includes more outlier trips that dilute tree splits.
-- **Bias offset correction:** Only -0.4s. Systematic bias (-55s) is too
-  interleaved with real prediction errors to correct post-hoc.
-
-## Next Steps
-
-- FT-Transformer (tabular transformer as third ensemble member)
-- Final submission packaging (Dockerfile, README writeup)
+  47% of params are critical.
+- **Removing month features:** 13s regression. Training data needs seasonal
+  signal even when eval is a single month.
+- **Log-target + Huber loss:** Huber(delta=300) in log-space is pure MSE.
+  Loss/metric mismatch.
+- **LGBM on full 37M rows:** Worse than 10M subsample. More data included
+  more outlier trips that diluted tree splits.
+- **Prediction rescaling/bias correction:** Only -0.8s gain. Not worth the
+  overfitting risk on eval.
+- **FT-Transformer with MSE loss:** 293s vs 287s with L1. Loss/metric
+  mismatch again (eval is MAE, train should match).
 
 ---
 
 ## Constraints
 
-- Inference: <= 200 ms per request on CPU (actual: <1 ms)
+- Inference: <= 200 ms per request on CPU (actual: <5 ms for 3-model ensemble)
 - Docker image: <= 2.5 GB (estimated: ~500 MB)
+- Total model weights: 6.3 MB (2.3 + 2.4 + 1.6)
 - No external API calls at inference time
 - No 2024 data in training
