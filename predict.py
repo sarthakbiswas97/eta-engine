@@ -30,8 +30,8 @@ _FT_PT_PATH = _ROOT / "ft_model.pt"
 _STATS_PATH = _ROOT / "data" / "zone_pair_stats" / "zone_pair_stats.pkl"
 
 # Ensemble weights (optimized on full dev set, 1.23M rows)
-_W_NN = 0.60
-_W_LGBM = 0.20
+_W_NN = 0.50
+_W_LGBM = 0.30
 _W_FT = 0.20
 
 # --- Load NN model ---
