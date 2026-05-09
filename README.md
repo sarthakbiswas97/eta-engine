@@ -11,13 +11,7 @@ timestamp, and passenger count.
 
 ## The Result
 
-```mermaid
-xychart-beta
-    title "MAE Progression (lower is better)"
-    x-axis ["Global Mean", "XGBoost Baseline", "Zone-Pair Stats", "NN v1", "NN v4b", "NN+LGBM", "NN+LGBM+FT"]
-    y-axis "Dev MAE (seconds)" 200 --> 600
-    bar [580, 351, 297, 272, 264, 254, 253]
-```
+![MAE Progression](assets/progression.png)
 
 | Method | Dev MAE | vs Baseline |
 |--------|---------|-------------|
@@ -135,15 +129,7 @@ overhead (~3-4GB savings).
 Built a tabular NN with learned zone embeddings and iterated through 4 versions.
 Each version was motivated by error analysis of the previous one.
 
-```mermaid
-xychart-beta
-    title "NN Dev MAE Across Training Epochs"
-    x-axis "Epoch" [1, 2, 3, 4, 5, 6, 7, 8]
-    y-axis "Dev MAE (seconds)" 250 --> 950
-    line [858, 414, 275, 272, 274, 272, 275, 275]
-    line [923, 394, 271, 270, 266, 269, 271, 270]
-    line [301, 280, 272, 269, 264, 268, 269, 271]
-```
+![NN Learning Curves](assets/learning_curves.png)
 
 | Version | Change | Dev MAE | Why |
 |---------|--------|---------|-----|
@@ -161,13 +147,7 @@ Stuck at 264s, I ran deep diagnostics instead of tuning blindly.
 
 **Finding: error is dominated by rare zone pairs.**
 
-```mermaid
-xychart-beta
-    title "NN MAE by Zone-Pair Frequency (the rare-pair problem)"
-    x-axis ["10k+", "1k-10k", "101-1k", "11-100", "1-10", "unseen"]
-    y-axis "MAE (seconds)" 0 --> 1000
-    bar [251, 291, 356, 566, 747, 926]
-```
+![Rare-Pair Diagnostic](assets/rare_pair_diagnostic.png)
 
 | Pair Frequency | Rows | MAE | Bias | Avg Duration |
 |---------------|------|-----|------|-------------|
@@ -193,13 +173,7 @@ categoricals -- they partition rather than interpolate. Bias dropped from
 further diversity. Self-attention discovers cross-feature interactions without
 hand-designed branches.
 
-```mermaid
-xychart-beta
-    title "Ensemble Weight Optimization (full 1.23M dev rows)"
-    x-axis "NN Weight" [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
-    y-axis "Dev MAE (seconds)" 252 --> 265
-    line [262, 258, 256, 255, 254, 253, 253, 254, 255, 257, 261]
-```
+![Ensemble Weights](assets/ensemble_weights.png)
 
 ### Phase 5: Inference Optimization
 
@@ -369,6 +343,8 @@ Fallback hierarchy for unseen pairs: pair -> pickup-zone -> dropoff-zone -> glob
 ---
 
 ## What Didn't Work
+
+![Failed Experiments](assets/failures.png)
 
 | Experiment | Expected | Actual | Lesson |
 |-----------|----------|--------|--------|
