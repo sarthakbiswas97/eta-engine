@@ -203,52 +203,156 @@ xychart-beta
 
 ### Phase 5: Inference Optimization
 
-FT-Transformer took 8.5ms per request (80% of ensemble latency). Exported to
-ONNX Runtime -- fused attention kernels brought it under 2ms. Also tested a
-smaller architecture (d=96, 2 layers, 169k params) that achieved 267s standalone
-with 58% fewer parameters.
+The FT-Transformer was the inference bottleneck -- 8.5ms out of 11ms total
+(80% of latency). Three optimization strategies were explored:
 
-| Component | Latency | % of Total |
-|-----------|---------|------------|
-| Feature extraction | <0.1ms | ~0% |
-| NN forward pass | 2.0ms | 50% |
-| FT-Transformer (ONNX) | 1.5ms | 38% |
-| LightGBM predict | 0.1ms | 3% |
-| **Total** | **~4ms** | **limit: 200ms** |
+**Strategy 1: ONNX Runtime export (no retraining)**
+
+Exported the PyTorch model to ONNX format. ONNX Runtime fuses operations
+(LayerNorm + matmul, multi-head attention) and eliminates Python dispatch
+overhead. Single line to export, 2-4x speedup.
+
+**Strategy 2: Architecture compression (retrained)**
+
+Reduced the FT-Transformer from 406k to 169k params:
+
+| Dimension | Original | Optimized | Savings |
+|-----------|----------|-----------|---------|
+| d_token | 128 | 96 | -25% (attention is O(d^2)) |
+| Layers | 3 | 2 | -33% compute |
+| Heads | 8 | 4 | Richer per-head (32-dim vs 16-dim) |
+| FFN | 128->170->128 | 96->96->96 | -44% FFN FLOPs |
+| **Total params** | **406k** | **169k** | **-58%** |
+
+The smaller model achieved 267s standalone (vs 287s for original) -- actually
+*better* because less overfitting with 2 layers on 10M training rows.
+
+**Strategy 3: Dynamic INT8 quantization (evaluated)**
+
+Researched `torch.ao.quantization.quantize_dynamic` for INT8 linear layers.
+Expected 1.5-2x speedup with <1s MAE cost. Available as a further optimization
+if needed.
+
+**Final inference breakdown:**
+
+| Component | Before | After (ONNX) | Technique |
+|-----------|--------|-------------|-----------|
+| Feature extraction | <0.1ms | <0.1ms | -- |
+| NN forward pass | 2.0ms | 2.0ms | -- |
+| FT-Transformer | **8.5ms** | **1.5ms** | ONNX fused kernels |
+| LightGBM predict | 0.1ms | 0.1ms | -- |
+| **Total** | **11ms** | **~4ms** | **2.75x faster** |
 
 ---
 
-## Architecture Details
+## Architecture Deep Dive
 
-### Neural Net (MLP with Zone Embeddings)
+### Neural Net: MLP with Zone Embeddings (560k params)
+
+The core idea: learn spatial relationships from data, not geography.
 
 ```
 Zone Branch:
-  pickup_zone  -> Embedding(266, 50)  --\
-  dropoff_zone -> Embedding(266, 50)  ---+-- [pu, do, pu*do, pu-do, pair_hash]
-  (pu, do)     -> HashEmbed(16384, 16) -/        |
-                                           concat(216) -> MLP(128) x2
+  pickup_zone  -> Embedding(266, 50)  ----\
+  dropoff_zone -> Embedding(266, 50)  -----+-- [pu, do, pu*do, pu-do, pair_hash]
+  (pu, do)     -> HashEmbed(16384, 16) ---/        |
+                                             concat(216) -> MLP(128) x2 -> 128-dim
 
 Continuous Branch:
-  24 features -> BatchNorm -> MLP(128) x2
+  24 features -> BatchNorm(24) -> MLP(128) x2 -> 128-dim
 
 Combined:
-  concat(256) -> ResidualBlock(256) -> ResidualBlock(128) -> Linear(1)
+  concat(256) -> ResidualBlock(256)
+             -> project(128) -> ResidualBlock(128)
+             -> Linear(64) -> SiLU -> Linear(1)
 ```
 
-560k params. Huber loss, OneCycleLR, 37M rows, Kaggle T4 GPU.
+**Key design decisions:**
 
-### FT-Transformer (from scratch)
+- **Separate pickup/dropoff embeddings (266 x 50 each):** The same zone
+  means different things as origin vs destination. Zone 132 (JFK airport area)
+  as pickup = outbound flight arrival; as dropoff = inbound departure.
+
+- **Element-wise product `pu * do`:** Captures zone-pair similarity. Zones
+  with similar trip patterns get similar embeddings, so their product is large.
+  Acts as a learned "how related are these zones?" signal.
+
+- **Element-wise difference `pu - do`:** Captures directionality. A trip
+  from A->B has the opposite sign from B->A. The model learns asymmetric
+  route effects (e.g., uphill vs downhill, one-way streets).
+
+- **Hash-based pair embedding (16384 buckets, dim 16):** Maps each (pickup,
+  dropoff) pair to a hash bucket for direct pair-level learning. 47% of model
+  params, but critical -- reducing to 8192 buckets caused 13s regression.
+
+- **Residual blocks:** `output = input + MLP(input)`. Stabilizes gradient flow
+  through the deeper combined MLP. Each block is `Linear -> BN -> SiLU ->
+  Dropout -> Linear`.
+
+- **OneCycleLR with 10% warmup:** LR warms from 2e-5 to 5e-4, then cosine
+  decays. The warmup is essential -- without it, randomly initialized
+  embeddings cause NaN loss in epoch 1 (learned the hard way with
+  CosineAnnealingLR).
+
+Trained on full 37M rows, Huber loss (delta=300), batch size 8192, AdamW
+(weight_decay=1e-4), gradient clipping (max_norm=1.0). Best at epoch 6,
+early stopped at epoch 9.
+
+### FT-Transformer: Feature Tokenizer Transformer (169k params)
+
+Built from scratch following [Gorishniy et al., NeurIPS 2021](https://arxiv.org/abs/2106.11959).
+The key idea: treat each feature as a token and let attention discover interactions.
 
 ```
-[CLS] + 24 numerical tokens + 2 categorical tokens = 27 tokens x 96-dim
-    -> TransformerEncoder(2 layers, 4 heads, pre-norm, GELU)
-    -> CLS output -> LayerNorm -> Linear(1)
+Step 1: TOKENIZE (each feature becomes a 96-dim vector)
+  ┌─────────────────────────────────────────────────────────────────┐
+  │ pair_mean=1964  -> W_0 * 1964 + b_0  = [0.3, -0.8, ...]       │
+  │ pair_median=1746 -> W_1 * 1746 + b_1  = [-0.1, 0.5, ...]      │
+  │ ... (24 separate Linear(1, 96) projections, NOT shared)        │
+  │ pickup_zone=100  -> EmbedTable_pu[100] = [0.7, 0.1, ...]      │
+  │ dropoff_zone=200 -> EmbedTable_do[200] = [-0.3, 0.8, ...]     │
+  │ [CLS]            -> learnable param    = [0.1, -0.2, ...]      │
+  └─────────────────────────────────────────────────────────────────┘
+  Result: 27 tokens x 96-dim
+
+Step 2: ATTEND (every feature looks at every other feature)
+  ┌─────────────────────────────────────────────────────────────────┐
+  │ Layer 1:                                                        │
+  │   LayerNorm -> MultiHeadAttention(4 heads, 24-dim each)        │
+  │     pickup_zone attends to dropoff_zone (route identity)       │
+  │     pair_rarity attends to pair_mean (trust calibration)       │
+  │     hour_sin attends to pair_tb_mean (temporal adjustment)     │
+  │   -> Residual + LayerNorm -> FFN(96 -> 96) -> Residual         │
+  │                                                                 │
+  │ Layer 2:                                                        │
+  │   Same structure, captures second-order interactions            │
+  │   CLS token has now aggregated signal from all features        │
+  └─────────────────────────────────────────────────────────────────┘
+
+Step 3: PREDICT
+  CLS token (96-dim) -> LayerNorm -> Linear(96, 1) -> duration
 ```
 
-169k params. L1 loss, 10M rows. Each feature is independently projected into
-token space. Self-attention discovers which features interact. Exported to ONNX
-for fused inference.
+**Why this architecture works for tabular data:**
+
+- **Per-feature tokenization:** Each feature gets its own projection (not
+  shared). `pair_mean` (~1000s scale) and `is_night` (0/1 scale) learn
+  completely different mappings into the same 96-dim space.
+
+- **Self-attention over features (not sequence):** Unlike NLP where attention
+  is over word positions, here it's over feature dimensions. The model learns
+  which features to combine for each prediction. No hand-designed feature
+  branches needed.
+
+- **[CLS] token as aggregator:** A learnable vector that attends to all
+  features and collects the information needed for the final prediction.
+  After 2 layers, it has "seen" every feature and every feature interaction.
+
+- **Pre-norm architecture:** LayerNorm before attention/FFN (not after), 
+  following modern transformer best practices for stable training.
+
+Trained on 10M rows, L1 loss (directly optimizes MAE), batch size 2048,
+AdamW (weight_decay=1e-5), OneCycleLR (lr=3e-4). Best at epoch 5.
 
 ### Feature Pipeline
 
