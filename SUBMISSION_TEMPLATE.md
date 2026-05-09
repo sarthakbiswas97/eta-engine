@@ -21,7 +21,7 @@ encodings, binary flags). The key insight was that the NN has high precision
 on common routes but a -106s underprediction bias on rare/long trips, while
 LightGBM has near-zero bias (-6s) because trees partition rather than
 interpolate. Adding the FT-Transformer with its +65s positive bias further
-improved diversity. Ensemble weights (0.6/0.2/0.2) were optimized via grid
+improved diversity. Ensemble weights (0.5/0.3/0.2) were optimized via grid
 search on the full dev set. Trained on Kaggle T4 GPUs (NN on 37M rows, LGBM
 and FT on 10M subsamples).
 
