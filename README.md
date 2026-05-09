@@ -5,7 +5,7 @@
 Predicting NYC taxi trip duration from pickup/dropoff zones, request
 timestamp, and passenger count.
 
-[Try it live on Colab](https://colab.research.google.com/) | [Pre-trained models on HuggingFace](https://huggingface.co/sarthakbiswas/eta-engine)
+[Try it live on Colab](https://colab.research.google.com/github/sarthakbiswas97/eta-engine/blob/main/notebooks/demo.ipynb) | [Pre-trained models on HuggingFace](https://huggingface.co/sarthakbiswas/eta-engine)
 
 ---
 
@@ -401,3 +401,12 @@ docker build -t my-eta . && docker run --rm -v $(pwd)/data:/work my-eta /work/de
 | Model weights | -- | **6.1 MB** |
 | External API calls | None | None |
 | 2024 data in training | Prohibited | Not used |
+
+---
+
+## Links
+
+- [Demo Notebook (Colab)](https://colab.research.google.com/github/sarthakbiswas97/eta-engine/blob/main/notebooks/demo.ipynb) -- run predictions, see charts, validate results
+- [Pre-trained Models (HuggingFace)](https://huggingface.co/sarthakbiswas/eta-engine) -- all model versions preserved
+- [Portfolio](https://www.sarthakb.xyz/)
+- [HuggingFace Profile](https://huggingface.co/sarthakbiswas)
