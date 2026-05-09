@@ -4,7 +4,7 @@
 
 ## Your final score
 
-Dev MAE: **252.7 s** (3-model ensemble on full 1.23M dev rows)
+Dev MAE: **253 s** (3-model ensemble on full 1.23M dev rows)
 
 ---
 
